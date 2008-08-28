@@ -111,8 +111,9 @@ work take a look at what osspd complains about.
 [3] For the time being, here's the git tree with all the necessary
     changes.  This tree is base on top of 2.6.27-rc3.
 
-    <insert link>
+    http://git.kernel.org/?p=linux/kernel/git/tj/misc.git;a=shortlog;h=cuse
+    git://git.kernel.org/pub/scm/linux/kernel/git/tj/misc.git cuse
 
 [4] And libfuse with the modifications can be found at...
 
-    <insert link>
+    http://userweb.kernel.org/~tj/ossp/fuse-cuse.tar.gz
