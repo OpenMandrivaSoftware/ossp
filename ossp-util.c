@@ -1,13 +1,12 @@
 /*
  * ossp-util - OSS Proxy: Common utilities
  *
- * Copyright (C) 2008       SUSE Linux Products GmbH
- * Copyright (C) 2008       Tejun Heo <teheo@suse.de>
+ * Copyright (C) 2008-2009  SUSE Linux Products GmbH
+ * Copyright (C) 2008-2009  Tejun Heo <tj@kernel.org>
  *
  * This file is released under the GPLv2.
  */
 
-#include <assert.h>
 #include <ctype.h>
 #include <fcntl.h>
 #include <inttypes.h>
@@ -15,7 +14,9 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/uio.h>
 #include <syslog.h>
 #include <unistd.h>
 #include "ossp-util.h"
@@ -127,13 +128,73 @@ int write_fill(int fd, const void *buf, size_t size)
 				rc = -EIO;
 			else
 				rc = -errno;
-			err_e(rc, "failed to write_fill %zu bytes from fd %d",
+			err_e(rc, "failed to write_fill %zu bytes to fd %d",
 			      size, fd);
 			return rc;
 		}
 		buf += ret;
 		size -= ret;
 	}
+	return 0;
+}
+
+void ring_fill(struct ring_buf *ring, const void *buf, size_t size)
+{
+	size_t tail;
+
+	assert(ring_space(ring) >= size);
+
+	tail = (ring->head + ring->size - ring->bytes) % ring->size;
+
+	if (ring->head >= tail) {
+		size_t todo = min(size, ring->size - ring->head);
+
+		memcpy(ring->buf + ring->head, buf, todo);
+		ring->head = (ring->head + todo) % ring->size;
+		ring->bytes += todo;
+		buf += todo;
+		size -= todo;
+	}
+
+	assert(ring->size - ring->head >= size);
+	memcpy(ring->buf + ring->head, buf, size);
+	ring->head += size;
+	ring->bytes += size;
+}
+
+void *ring_data(struct ring_buf *ring, size_t *sizep)
+{
+	size_t tail;
+
+	if (!ring->bytes)
+		return NULL;
+
+	tail = (ring->head + ring->size - ring->bytes) % ring->size;
+
+	*sizep = min(ring->bytes, ring->size - tail);
+	return ring->buf + tail;
+}
+
+int ring_resize(struct ring_buf *ring, size_t new_size)
+{
+	struct ring_buf new_ring = { .size = new_size };
+	void *p;
+	size_t size;
+
+	if (ring_bytes(ring) > new_size)
+		return -ENOSPC;
+
+	new_ring.buf = calloc(1, new_size);
+	if (new_size && !new_ring.buf)
+		return -ENOMEM;
+
+	while ((p = ring_data(ring, &size))) {
+		ring_fill(&new_ring, p, size);
+		ring_consume(ring, size);
+	}
+
+	free(ring->buf);
+	*ring = new_ring;
 	return 0;
 }
 
@@ -214,7 +275,7 @@ int get_proc_self_info(pid_t pid, pid_t *ppid_r,
 	return rc;
 }
 
-int ossp_slave_process_command(int cmd_fd, int reply_fd,
+int ossp_slave_process_command(int cmd_fd,
 			       ossp_action_fn_t const *action_fn_tbl,
 			       int (*action_pre_fn)(void),
 			       void (*action_post_fn)(void))
@@ -222,15 +283,22 @@ int ossp_slave_process_command(int cmd_fd, int reply_fd,
 	static struct sized_buf carg_sbuf = { }, rarg_sbuf = { };
 	static struct sized_buf din_sbuf = { }, dout_sbuf = { };
 	struct ossp_cmd cmd;
+	int fd = -1;
+	char cmsg_buf[CMSG_SPACE(sizeof(fd))];
+	struct iovec iov = { &cmd, sizeof(cmd) };
+	struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1,
+			      .msg_control = cmsg_buf,
+			      .msg_controllen = sizeof(cmsg_buf) };
+	struct cmsghdr *cmsg;
 	size_t carg_size, din_size, rarg_size, dout_size;
 	char *carg = NULL, *din = NULL, *rarg = NULL, *dout = NULL;
 	struct ossp_reply reply = { .magic = OSSP_REPLY_MAGIC };
 	ssize_t ret;
 
-	ret = read(cmd_fd, &cmd, sizeof(cmd));
+	ret = recvmsg(cmd_fd, &msg, 0);
 	if (ret == 0)
 		return 0;
-	if (ret <= 0) {
+	if (ret < 0) {
 		ret = -errno;
 		err_e(ret, "failed to read command channel");
 		return ret;
@@ -247,6 +315,18 @@ int ossp_slave_process_command(int cmd_fd, int reply_fd,
 		return -EINVAL;
 	}
 
+	for (cmsg = CMSG_FIRSTHDR(&msg); cmsg;
+	     cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+		if (cmsg->cmsg_level == SOL_SOCKET &&
+		    cmsg->cmsg_type == SCM_RIGHTS)
+			fd = *(int *)CMSG_DATA(cmsg);
+		else {
+			err("unknown cmsg %d:%d received (opcode %d)",
+			    cmsg->cmsg_level, cmsg->cmsg_type, cmd.opcode);
+			return -EINVAL;
+		}
+	}
+
 	if (cmd.opcode >= OSSP_NR_OPCODES) {
 		err("unknown opcode %d", cmd.opcode);
 		return -EINVAL;
@@ -256,6 +336,11 @@ int ossp_slave_process_command(int cmd_fd, int reply_fd,
 	din_size = cmd.din_size;
 	rarg_size = ossp_arg_sizes[cmd.opcode].rarg_size;
 	dout_size = cmd.dout_size;
+
+	if ((fd >= 0) != ossp_arg_sizes[cmd.opcode].has_fd) {
+		err("fd=%d unexpected for opcode %d", fd, cmd.opcode);
+		return -EINVAL;
+	}
 
 	if (ensure_sbuf_size(&carg_sbuf, carg_size) ||
 	    ensure_sbuf_size(&din_sbuf, din_size) ||
@@ -287,8 +372,8 @@ int ossp_slave_process_command(int cmd_fd, int reply_fd,
 		ret = action_pre_fn();
 		if (ret == 0) {
 			ret = action_fn_tbl[cmd.opcode](cmd.opcode, carg,
-							din, din_size,
-							rarg, dout, &dout_size);
+							din, din_size, rarg,
+							dout, &dout_size, fd);
 			action_post_fn();
 		}
 	}
@@ -301,9 +386,9 @@ int ossp_slave_process_command(int cmd_fd, int reply_fd,
 		dout_size = 0;
 	}
 
-	if (write_fill(reply_fd, &reply, sizeof(reply)) < 0 ||
-	    write_fill(reply_fd, rarg, rarg_size) < 0 ||
-	    write_fill(reply_fd, dout, dout_size) < 0)
+	if (write_fill(cmd_fd, &reply, sizeof(reply)) < 0 ||
+	    write_fill(cmd_fd, rarg, rarg_size) < 0 ||
+	    write_fill(cmd_fd, dout, dout_size) < 0)
 		return -EIO;
 
 	return 1;

@@ -1,17 +1,16 @@
 /*
  * osspd - OSS Proxy Daemon: emulate OSS device using CUSE
  *
- * Copyright (C) 2008       SUSE Linux Products GmbH
- * Copyright (C) 2008       Tejun Heo <teheo@suse.de>
+ * Copyright (C) 2008-2009  SUSE Linux Products GmbH
+ * Copyright (C) 2008-2009  Tejun Heo <tj@kernel.org>
  *
  * This file is released under the GPLv2.
  */
 
-#define FUSE_USE_VERSION 29
+#define FUSE_USE_VERSION 28
 #define _GNU_SOURCE
 
 #include <assert.h>
-#include <cuse.h>
 #include <cuse_lowlevel.h>
 #include <fcntl.h>
 #include <fuse_opt.h>
@@ -23,9 +22,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <signal.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/epoll.h>
+#include <sys/socket.h>
 #include <sys/soundcard.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include "ossp.h"
@@ -55,6 +57,7 @@ enum {
 	DFL_ADSP_MAJOR		= 14,
 	DFL_ADSP_MINOR		= 12,
 	DFL_MAX_STREAMS		= 256,
+	MIXER_PUT_DELAY		= 600,	/* 10 mins */
 };
 
 struct ossp_uid_cnt {
@@ -66,20 +69,21 @@ struct ossp_uid_cnt {
 struct ossp_mixer {
 	pid_t			pgrp;
 	struct list_head	link;
+	struct list_head	delayed_put_link;
 	unsigned		refcnt;
 	/* the following two fields are protected by mixer_mutex */
 	int			vol[2][2];
 	int			modify_counter;
+	time_t			put_expires;
 };
 
 struct ossp_mixer_cmd {
 	struct ossp_mixer	*mixer;
 	struct ossp_mixer_arg	get;
 	struct ossp_mixer_arg	set;
-	int			nr_gets;
+	int			nr_gets[2][2];
 	int			out_dir;
-	void			*out_buf;
-	size_t			*out_bufszp;
+	int			rvol;
 };
 
 #define for_each_vol(i, j)						\
@@ -91,6 +95,9 @@ struct ossp_stream {
 	struct list_head	pgrp_link;
 	struct list_head	notify_link;
 	unsigned		refcnt;
+	pthread_mutex_t		cmd_mutex;
+	pthread_mutex_t		mmap_mutex;
+	struct fuse_pollhandle	*ph;
 
 	/* stream owner info */
 	pid_t			pid;
@@ -99,10 +106,8 @@ struct ossp_stream {
 	gid_t			gid;
 
 	/* slave info */
-	pthread_mutex_t		cmd_mutex;
 	pid_t			slave_pid;
 	int			cmd_fd;
-	int			reply_fd;
 	int			notify_tx;
 	int			notify_rx;
 
@@ -110,14 +115,16 @@ struct ossp_stream {
 	int			dead;
 
 	struct ossp_uid_cnt	*ucnt;
-	struct fuse		*fuse;	/* associated fuse instance */
+	struct fuse_session	*se;	/* associated fuse session */
 	struct ossp_mixer	*mixer;
 };
 
 struct ossp_dsp_stream {
 	struct ossp_stream	os;
-	unsigned		nonblock_set:1;
-	unsigned		nonblock:1;
+	int			mmap_fd[2];
+	int			nr_mmaps[2];
+	int			mmapped;
+	int			nonblock;
 };
 
 #define os_to_dsps(_os)		container_of(_os, struct ossp_dsp_stream, os)
@@ -130,7 +137,7 @@ static char dsp_slave_path[PATH_MAX];
 static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t mixer_mutex = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t os_id;
-static unsigned nr_os;
+static unsigned nr_os, nr_mixers;
 static struct list_head *mixer_tbl;	/* indexed by PGRP */
 static struct list_head *os_tbl;	/* indexed by ID */
 static struct list_head *os_pgrp_tbl;	/* indexed by PGRP */
@@ -138,9 +145,18 @@ static struct list_head *os_notify_tbl;	/* indexed by notify fd */
 static LIST_HEAD(uid_cnt_list);
 static int notify_epfd;			/* epoll used to monitor notify fds */
 static pthread_t notify_poller_thread;
+static pthread_t mixer_delayed_put_thread;
 static pthread_t cuse_mixer_thread;
 static pthread_t cuse_adsp_thread;
 static pthread_cond_t notify_poller_kill_wait = PTHREAD_COND_INITIALIZER;
+static LIST_HEAD(mixer_delayed_put_head); /* delayed reference */
+static pthread_cond_t mixer_delayed_put_cond = PTHREAD_COND_INITIALIZER;
+
+static int init_wait_fd = -1;
+static int exit_on_idle;
+static struct fuse_session *mixer_se;
+static struct fuse_session *dsp_se;
+static struct fuse_session *adsp_se;
 
 static void put_os(struct ossp_stream *os);
 
@@ -224,13 +240,16 @@ static struct ossp_stream *find_os_by_notify_rx(int notify_rx)
 
 static ssize_t exec_cmd(struct ossp_stream *os, enum ossp_opcode opcode,
 	const void *carg, size_t carg_size, const void *din, size_t din_size,
-	void *rarg, size_t rarg_size, void *dout, size_t *dout_sizep)
+	void *rarg, size_t rarg_size, void *dout, size_t *dout_sizep, int fd)
 {
 	size_t dout_size = dout_sizep ? *dout_sizep : 0;
 	struct ossp_cmd cmd = { .magic = OSSP_CMD_MAGIC, .opcode = opcode,
 				 .din_size = din_size,
 				 .dout_size = dout_size };
+	struct iovec iov = { &cmd, sizeof(cmd) };
+	struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1 };
 	struct ossp_reply reply = { };
+	char cmsg_buf[CMSG_SPACE(sizeof(fd))];
 	char reason[512];
 	int rc;
 
@@ -243,14 +262,34 @@ static ssize_t exec_cmd(struct ossp_stream *os, enum ossp_opcode opcode,
 
 	pthread_mutex_lock(&os->cmd_mutex);
 
-	if ((rc = write_fill(os->cmd_fd, &cmd, sizeof(cmd))) < 0 ||
-	    (rc = write_fill(os->cmd_fd, carg, carg_size)) < 0 ||
-	    (rc = write_fill(os->cmd_fd, din, din_size)) < 0) {
-		snprintf(reason, sizeof(reason), "can't tranfer command: %s",
+	if (fd >= 0) {
+		struct cmsghdr *cmsg;
+
+		msg.msg_control = cmsg_buf;
+		msg.msg_controllen = sizeof(cmsg_buf);
+		cmsg = CMSG_FIRSTHDR(&msg);
+		cmsg->cmsg_level = SOL_SOCKET;
+		cmsg->cmsg_type = SCM_RIGHTS;
+		cmsg->cmsg_len = CMSG_LEN(sizeof(fd));
+		*(int *)CMSG_DATA(cmsg) = fd;
+		msg.msg_controllen = cmsg->cmsg_len;
+	}
+
+	if (sendmsg(os->cmd_fd, &msg, 0) <= 0) {
+		rc = -errno;
+		snprintf(reason, sizeof(reason), "command sendmsg failed: %s",
 			 strerror(-rc));
 		goto fail;
 	}
-	if ((rc = read_fill(os->reply_fd, &reply, sizeof(reply))) < 0) {
+
+	if ((rc = write_fill(os->cmd_fd, carg, carg_size)) < 0 ||
+	    (rc = write_fill(os->cmd_fd, din, din_size)) < 0) {
+		snprintf(reason, sizeof(reason),
+			 "can't tranfer command argument and/or data: %s",
+			 strerror(-rc));
+		goto fail;
+	}
+	if ((rc = read_fill(os->cmd_fd, &reply, sizeof(reply))) < 0) {
 		snprintf(reason, sizeof(reason), "can't read reply: %s",
 			 strerror(-rc));
 		goto fail;
@@ -279,20 +318,20 @@ static ssize_t exec_cmd(struct ossp_stream *os, enum ossp_opcode opcode,
 	if (dout_sizep)
 		*dout_sizep = dout_size;
 
-	if ((rc = read_fill(os->reply_fd, rarg, rarg_size)) < 0 ||
-	    (rc = read_fill(os->reply_fd, dout, dout_size)) < 0) {
+	if ((rc = read_fill(os->cmd_fd, rarg, rarg_size)) < 0 ||
+	    (rc = read_fill(os->cmd_fd, dout, dout_size)) < 0) {
 		snprintf(reason, sizeof(reason), "can't read data out: %s",
 			 strerror(-rc));
 		goto fail;
 	}
 
- out_unlock:
+out_unlock:
 	pthread_mutex_unlock(&os->cmd_mutex);
 	dbg1_os(os, "  completed, result=%d dout=%zu",
 		reply.result, dout_size);
 	return reply.result;
 
- fail:
+fail:
 	pthread_mutex_unlock(&os->cmd_mutex);
 	warn_os(os, "communication with slave failed (%s)", reason);
 	os->dead = 1;
@@ -304,20 +343,20 @@ static ssize_t exec_simple_cmd(struct ossp_stream *os,
 {
 	return exec_cmd(os, opcode,
 			carg, ossp_arg_sizes[opcode].carg_size, NULL, 0,
-			rarg, ossp_arg_sizes[opcode].rarg_size, NULL, NULL);
+			rarg, ossp_arg_sizes[opcode].rarg_size, NULL, NULL, -1);
 }
 
-static int ioctl_prep_uarg(void *in, size_t in_sz, void *out, size_t out_sz,
-			   void *uarg, const void *in_buf, size_t in_bufsz,
-			   size_t *out_bufszp,
-			   struct iovec *in_iov, struct iovec *out_iov)
+static int ioctl_prep_uarg(fuse_req_t req, void *in, size_t in_sz, void *out,
+			   size_t out_sz, void *uarg, const void *in_buf,
+			   size_t in_bufsz, size_t out_bufsz)
 {
+	struct iovec in_iov = { }, out_iov = { };
 	int retry = 0;
 
 	if (in) {
 		if (!in_bufsz) {
-			in_iov[0].iov_base = uarg;
-			in_iov[0].iov_len = in_sz;
+			in_iov.iov_base = uarg;
+			in_iov.iov_len = in_sz;
 			retry = 1;
 		} else {
 			assert(in_bufsz == in_sz);
@@ -326,31 +365,33 @@ static int ioctl_prep_uarg(void *in, size_t in_sz, void *out, size_t out_sz,
 	}
 
 	if (out) {
-		if (!*out_bufszp) {
-			out_iov[0].iov_base = uarg;
-			out_iov[0].iov_len = out_sz;
+		if (!out_bufsz) {
+			out_iov.iov_base = uarg;
+			out_iov.iov_len = out_sz;
 			retry = 1;
-		} else {
-			assert(*out_bufszp == out_sz);
-			*out_bufszp = 0;
-		}
+		} else
+			assert(out_bufsz == out_sz);
 	}
+
+	if (retry)
+		fuse_reply_ioctl_retry(req, &in_iov, 1, &out_iov, 1);
 
 	return retry;
 }
 
 #define PREP_UARG(inp, outp) do {					\
-	if (ioctl_prep_uarg(inp, sizeof(*inp), outp, sizeof(*outp),	\
-			    uarg, in_buf, in_bufsz, out_bufszp,		\
-			    in_iov, out_iov)) {				\
-		*flagsp |= FUSE_IOCTL_RETRY;				\
-		return 0;						\
-	}								\
+	if (ioctl_prep_uarg(req, (inp), sizeof(*(inp)),			\
+			    (outp), sizeof(*(outp)), uarg,		\
+			    in_buf, in_bufsz, out_bufsz))		\
+		return;							\
 } while (0)
 
-#define PUT_UARG(outp) do {						\
-	memcpy(out_buf, outp, sizeof(*outp));				\
-	*out_bufszp = sizeof(*outp);					\
+#define IOCTL_RETURN(result, outp) do {					\
+	if ((outp) != NULL)						\
+		fuse_reply_ioctl(req, result, (outp), sizeof(*(outp)));	\
+	else								\
+		fuse_reply_ioctl(req, result, NULL, 0);			\
+	return;								\
 } while (0)
 
 
@@ -358,18 +399,58 @@ static int ioctl_prep_uarg(void *in, size_t in_sz, void *out, size_t out_sz,
  * Mixer implementation
  */
 
+static void put_mixer_real(struct ossp_mixer *mixer)
+{
+	if (!--mixer->refcnt) {
+		dbg0("DESTROY mixer(%d)", mixer->pgrp);
+		list_del_init(&mixer->link);
+		list_del_init(&mixer->delayed_put_link);
+		free(mixer);
+		nr_mixers--;
+
+		/*
+		 * If exit_on_idle, mixer for pgrp0 is touched during
+		 * init and each stream has mixer attached.  As mixers
+		 * are destroyed after they have been idle for
+		 * MIXER_PUT_DELAY seconds, we can use it for idle
+		 * detection.  Note that this might race with
+		 * concurrent open.  The race is inherent.
+		 */
+		if (exit_on_idle && !nr_mixers) {
+			info("idle, exiting");
+			exit(0);
+		}
+	}
+}
+
 static struct ossp_mixer *get_mixer(pid_t pgrp)
 {
 	struct ossp_mixer *mixer;
 
 	pthread_mutex_lock(&mutex);
 
+	/* is there a matching one? */
 	mixer = find_mixer_locked(pgrp);
 	if (mixer) {
-		mixer->refcnt++;
+		if (list_empty(&mixer->delayed_put_link))
+			mixer->refcnt++;
+		else
+			list_del_init(&mixer->delayed_put_link);
 		goto out_unlock;
 	}
 
+	/* reap delayed put list if there are too many mixers */
+	while (nr_mixers > 2 * max_streams &&
+	       !list_empty(&mixer_delayed_put_head)) {
+		struct ossp_mixer *mixer =
+			list_first_entry(&mixer_delayed_put_head,
+					 struct ossp_mixer, delayed_put_link);
+
+		assert(mixer->refcnt == 1);
+		put_mixer_real(mixer);
+	}
+
+	/* create a new one */
 	mixer = calloc(1, sizeof(*mixer));
 	if (!mixer) {
 		warn("failed to allocate mixer for %d", pgrp);
@@ -379,29 +460,70 @@ static struct ossp_mixer *get_mixer(pid_t pgrp)
 
 	mixer->pgrp = pgrp;
 	INIT_LIST_HEAD(&mixer->link);
+	INIT_LIST_HEAD(&mixer->delayed_put_link);
 	mixer->refcnt = 1;
 	memset(mixer->vol, -1, sizeof(mixer->vol));
 
 	list_add(&mixer->link, mixer_tbl_head(pgrp));
+	nr_mixers++;
 	dbg0("CREATE mixer(%d)", pgrp);
 
- out_unlock:
+out_unlock:
 	pthread_mutex_unlock(&mutex);
 	return mixer;
 }
 
 static void put_mixer(struct ossp_mixer *mixer)
 {
-	if (!mixer)
-		return;
+	pthread_mutex_lock(&mutex);
+
+	if (mixer) {
+		if (mixer->refcnt == 1) {
+			struct timespec ts;
+
+			clock_gettime(CLOCK_REALTIME, &ts);
+			mixer->put_expires = ts.tv_sec + MIXER_PUT_DELAY;
+			list_add_tail(&mixer->delayed_put_link,
+				      &mixer_delayed_put_head);
+			pthread_cond_signal(&mixer_delayed_put_cond);
+		} else
+			put_mixer_real(mixer);
+	}
+
+	pthread_mutex_unlock(&mutex);
+}
+
+static void *mixer_delayed_put_worker(void *arg)
+{
+	struct ossp_mixer *mixer;
+	struct timespec ts;
+	time_t now;
 
 	pthread_mutex_lock(&mutex);
-	if (!--mixer->refcnt) {
-		dbg0("DESTROY mixer(%d)", mixer->pgrp);
-		list_del_init(&mixer->link);
-		free(mixer);
+again:
+	clock_gettime(CLOCK_REALTIME, &ts);
+	now = ts.tv_sec;
+
+	mixer = NULL;
+	while (!list_empty(&mixer_delayed_put_head)) {
+		mixer = list_first_entry(&mixer_delayed_put_head,
+					 struct ossp_mixer, delayed_put_link);
+
+		if (now <= mixer->put_expires)
+			break;
+
+		assert(mixer->refcnt == 1);
+		put_mixer_real(mixer);
+		mixer = NULL;
 	}
-	pthread_mutex_unlock(&mutex);
+
+	if (mixer) {
+		ts.tv_sec = mixer->put_expires + 1;
+		pthread_cond_timedwait(&mixer_delayed_put_cond, &mutex, &ts);
+	} else
+		pthread_cond_wait(&mixer_delayed_put_cond, &mutex);
+
+	goto again;
 }
 
 static void init_mixer_cmd(struct ossp_mixer_cmd *mxcmd,
@@ -420,11 +542,12 @@ static int exec_mixer_cmd(struct ossp_mixer_cmd *mxcmd, struct ossp_stream *os)
 
 	rc = exec_simple_cmd(os, OSSP_MIXER, &arg, &arg);
 	if (rc >= 0) {
-		for (i = 0; i < 2; i++)
-			for (j = 0; j < 2; j++)
+		for_each_vol(i, j)
+			if (arg.vol[i][j] >= 0) {
 				mxcmd->get.vol[i][j] += arg.vol[i][j];
-		mxcmd->nr_gets++;
-		dbg1_os(os, "volume set=%d/%d:%d/%d get=%d/%d:%d/%d",
+				mxcmd->nr_gets[i][j]++;
+			}
+		dbg0_os(os, "volume set=%d/%d:%d/%d get=%d/%d:%d/%d",
 			mxcmd->set.vol[PLAY][LEFT], mxcmd->set.vol[PLAY][RIGHT],
 			mxcmd->set.vol[REC][LEFT], mxcmd->set.vol[REC][RIGHT],
 			mxcmd->get.vol[PLAY][LEFT], mxcmd->get.vol[PLAY][RIGHT],
@@ -438,7 +561,6 @@ static void finish_mixer_cmd(struct ossp_mixer_cmd *mxcmd)
 {
 	struct ossp_mixer *mixer = mxcmd->mixer;
 	int dir = mxcmd->out_dir;
-	int nr_gets = mxcmd->nr_gets;
 	int vol[2][2] = { { -1, -1 }, { -1, -1 } };
 	int i, j, vol_changed = 0;
 
@@ -449,9 +571,11 @@ static void finish_mixer_cmd(struct ossp_mixer_cmd *mxcmd)
 			vol[i][j] = mxcmd->set.vol[i][j];
 			vol_changed = 1;
 		}
-		if (nr_gets)
-			vol[i][j] = mxcmd->get.vol[i][j] / nr_gets;
-		else if (vol[i][j] < 0)
+		if (mxcmd->nr_gets[i][j])
+			vol[i][j] = mxcmd->get.vol[i][j] / mxcmd->nr_gets[i][j];
+		else if (mixer->vol[i][j] >= 0)
+			vol[i][j] = mixer->vol[i][j];
+		else
 			vol[i][j] = 100;
 
 		vol[i][j] = min(max(0, vol[i][j]), 100);
@@ -459,20 +583,16 @@ static void finish_mixer_cmd(struct ossp_mixer_cmd *mxcmd)
 
 	mixer->modify_counter += vol_changed;
 
-	if (dir >= 0 && mxcmd->out_buf) {
-		*(int *)mxcmd->out_buf = vol[dir][LEFT] |
-					  (vol[dir][RIGHT] << 8);
-		*mxcmd->out_bufszp = sizeof(int);
-	}
+	if (dir >= 0)
+		mxcmd->rvol = vol[dir][LEFT] | (vol[dir][RIGHT] << 8);
 
 	pthread_mutex_unlock(&mixer_mutex);
 }
 
-static int mixer_simple_ioctl(struct ossp_mixer *mixer, unsigned cmd,
-			      void *uarg, unsigned *flagsp,
-			      const void *in_buf, size_t in_bufsz,
-			      void *out_buf, size_t *out_bufszp,
-			      struct iovec *in_iov, struct iovec *out_iov)
+static void mixer_simple_ioctl(fuse_req_t req, struct ossp_mixer *mixer,
+			       unsigned cmd, void *uarg, const void *in_buf,
+			       size_t in_bufsz, size_t out_bufsz,
+			       int *not_minep)
 {
 	const char *id = "OSS Proxy", *name = "Mixer";
 	int i;
@@ -485,8 +605,7 @@ static int mixer_simple_ioctl(struct ossp_mixer *mixer, unsigned cmd,
 		strncpy(info.id, id, sizeof(info.id) - 1);
 		strncpy(info.name, name, sizeof(info.name) - 1);
 		info.modify_counter = mixer->modify_counter;
-		PUT_UARG(&info);
-		return 0;
+		IOCTL_RETURN(0, &info);
 	}
 
 	case SOUND_OLD_MIXER_INFO: {
@@ -495,8 +614,7 @@ static int mixer_simple_ioctl(struct ossp_mixer *mixer, unsigned cmd,
 		PREP_UARG(NULL, &info);
 		strncpy(info.id, id, sizeof(info.id) - 1);
 		strncpy(info.name, name, sizeof(info.name) - 1);
-		PUT_UARG(&info);
-		return 0;
+		IOCTL_RETURN(0, &info);
 	}
 
 	case OSS_GETVERSION:
@@ -515,35 +633,37 @@ static int mixer_simple_ioctl(struct ossp_mixer *mixer, unsigned cmd,
 		goto puti;
 	puti:
 		PREP_UARG(NULL, &i);
-		PUT_UARG(&i);
-		return 0;
+		IOCTL_RETURN(0, &i);
 
 	case SOUND_MIXER_WRITE_RECSRC:
-		return 0;
-	}
+		IOCTL_RETURN(0, NULL);
 
-	return -EAGAIN;
+	default:
+		*not_minep = 1;
+		return;
+	}
+	assert(0);
 }
 
-static int mixer_do_ioctl(struct ossp_mixer *mixer, unsigned cmd,
-			  void *uarg, unsigned *flagsp,
-			  const void *in_buf, size_t in_bufsz,
-			  void *out_buf, size_t *out_bufszp,
-			  struct iovec *in_iov, struct iovec *out_iov)
+static void mixer_do_ioctl(fuse_req_t req, struct ossp_mixer *mixer,
+			   unsigned cmd, void *uarg, const void *in_buf,
+			   size_t in_bufsz, size_t out_bufsz)
 {
-	int slot = cmd & 0xff, dir;
 	struct ossp_mixer_cmd mxcmd;
 	struct ossp_stream *os, **osa;
+	int not_mine = 0;
+	int slot = cmd & 0xff, dir;
 	int nr_os;
 	int i, rc;
 
-	rc = mixer_simple_ioctl(mixer, cmd, uarg, flagsp, in_buf, in_bufsz,
-				out_buf, out_bufszp, in_iov, out_iov);
-	if (rc != -EAGAIN)
-		return rc;
+	mixer_simple_ioctl(req, mixer, cmd, uarg, in_buf, in_bufsz, out_bufsz,
+			   &not_mine);
+	if (!not_mine)
+		return;
 
+	rc = -ENXIO;
 	if (!(cmd & (SIOC_IN | SIOC_OUT)))
-		return -ENXIO;
+		goto err;
 
 	/*
 	 * Okay, it's not one of the easy ones.  Build mxcmd for
@@ -563,8 +683,7 @@ static int mixer_do_ioctl(struct ossp_mixer *mixer, unsigned cmd,
 		break;
 	default:
 		i = 0;
-		PUT_UARG(&i);
-		return 0;
+		IOCTL_RETURN(0, &i);
 	}
 
 	init_mixer_cmd(&mxcmd, mixer);
@@ -572,17 +691,16 @@ static int mixer_do_ioctl(struct ossp_mixer *mixer, unsigned cmd,
 	if (cmd & SIOC_IN) {
 		unsigned l, r;
 
+		rc = -EINVAL;
 		l = i & 0xff;
 		r = (i >> 8) & 0xff;
 		if (l > 100 || r > 100)
-			return -EINVAL;
+			goto err;
 
 		mixer->vol[dir][LEFT] = mxcmd.set.vol[dir][LEFT] = l;
 		mixer->vol[dir][RIGHT] = mxcmd.set.vol[dir][RIGHT] = r;
 	}
 	mxcmd.out_dir = dir;
-	mxcmd.out_buf = out_buf;
-	mxcmd.out_bufszp = out_bufszp;
 
 	/*
 	 * Apply volume conrol
@@ -592,7 +710,8 @@ static int mixer_do_ioctl(struct ossp_mixer *mixer, unsigned cmd,
 	osa = calloc(max_streams, sizeof(osa[0]));
 	if (!osa) {
 		pthread_mutex_unlock(&mutex);
-		return -ENOMEM;
+		rc = -ENOMEM;
+		goto err;
 	}
 
 	nr_os = 0;
@@ -613,52 +732,61 @@ static int mixer_do_ioctl(struct ossp_mixer *mixer, unsigned cmd,
 
 	finish_mixer_cmd(&mxcmd);
 	free(osa);
-	return 0;
+
+	IOCTL_RETURN(0, out_bufsz ? &mxcmd.rvol : NULL);
+
+err:
+	fuse_reply_err(req, -rc);
 }
 
-static int mixer_open(const char *path, struct fuse_file_info *fi)
+static void mixer_open(fuse_req_t req, struct fuse_file_info *fi)
 {
-	pid_t pid = fuse_get_context()->pid, pgrp;
+	pid_t pid = fuse_req_ctx(req)->pid, pgrp;
 	struct ossp_mixer *mixer;
 	int rc;
 
 	rc = get_proc_self_info(pid, &pgrp, NULL, 0);
 	if (rc) {
 		err_e(rc, "get_proc_self_info(%d) failed", pid);
-		return rc;
+		fuse_reply_err(req, -rc);
+		return;
 	}
 
 	mixer = get_mixer(pgrp);
 	fi->fh = pgrp;
 
-	return mixer ? 0 : -ENOMEM;
+	if (mixer)
+		fuse_reply_open(req, fi);
+	else
+		fuse_reply_err(req, ENOMEM);
 }
 
-static int mixer_ioctl(const char *path, int signed_cmd, void *uarg,
-		       struct fuse_file_info *fi, unsigned *flagsp,
-		       const void *in_buf, size_t in_bufsz,
-		       void *out_buf, size_t *out_bufszp,
-		       struct iovec *in_iov, struct iovec *out_iov)
+static void mixer_ioctl(fuse_req_t req, int signed_cmd, void *uarg,
+			struct fuse_file_info *fi, unsigned int flags,
+			const void *in_buf, size_t in_bufsz, size_t out_bufsz)
 {
 	struct ossp_mixer *mixer;
 
 	mixer = find_mixer(fi->fh);
-	if (!mixer)
-		return -EBADF;
+	if (!mixer) {
+		fuse_reply_err(req, EBADF);
+		return;
+	}
 
-	return mixer_do_ioctl(mixer, signed_cmd, uarg, flagsp, in_buf, in_bufsz,
-			      out_buf, out_bufszp, in_iov, out_iov);
+	mixer_do_ioctl(req, mixer, signed_cmd, uarg, in_buf, in_bufsz,
+		       out_bufsz);
 }
 
-static int mixer_release(const char *path, struct fuse_file_info *fi)
+static void mixer_release(fuse_req_t req, struct fuse_file_info *fi)
 {
 	struct ossp_mixer *mixer;
 
 	mixer = find_mixer(fi->fh);
-	if (!mixer)
-		return -EBADF;
-	put_mixer(mixer);
-	return 0;
+	if (mixer) {
+		put_mixer(mixer);
+		fuse_reply_err(req, 0);
+	} else
+		fuse_reply_err(req, EBADF);
 }
 
 
@@ -667,7 +795,7 @@ static int mixer_release(const char *path, struct fuse_file_info *fi)
  */
 
 static int alloc_os(size_t stream_size, pid_t pid, uid_t pgrp,
-		    uid_t uid, gid_t gid, int cmd_tx, int cmd_rx,
+		    uid_t uid, gid_t gid, int cmd_sock,
 		    const int *notify, struct ossp_stream **osp)
 {
 	struct ossp_uid_cnt *tmp_ucnt, *ucnt = NULL;
@@ -687,6 +815,10 @@ static int alloc_os(size_t stream_size, pid_t pid, uid_t pgrp,
 	rc = -pthread_mutex_init(&os->cmd_mutex, NULL);
 	if (rc)
 		goto err_free;
+
+	rc = -pthread_mutex_init(&os->mmap_mutex, NULL);
+	if (rc)
+		goto err_destroy_cmd_mutex;
 
 	pthread_mutex_lock(&mutex);
 
@@ -713,8 +845,7 @@ static int alloc_os(size_t stream_size, pid_t pid, uid_t pgrp,
 		goto err_unlock;
 
 	os->id = ++os_id;
-	os->cmd_fd = cmd_tx;
-	os->reply_fd = cmd_rx;
+	os->cmd_fd = cmd_sock;
 	os->notify_tx = notify[1];
 	os->notify_rx = notify[0];
 	os->pid = pid;
@@ -732,10 +863,12 @@ static int alloc_os(size_t stream_size, pid_t pid, uid_t pgrp,
 	pthread_mutex_unlock(&mutex);
 	return 0;
 
- err_unlock:
+err_unlock:
 	pthread_mutex_unlock(&mutex);
+	pthread_mutex_destroy(&os->mmap_mutex);
+err_destroy_cmd_mutex:
 	pthread_mutex_destroy(&os->cmd_mutex);
- err_free:
+err_free:
 	free(os);
 	return rc;
 }
@@ -797,9 +930,10 @@ static void put_os(struct ossp_stream *os)
 	pthread_mutex_unlock(&mutex);
 
 	close(os->cmd_fd);
-	close(os->reply_fd);
 	close(os->notify_tx);
 	put_mixer(os->mixer);
+	pthread_mutex_destroy(&os->cmd_mutex);
+	pthread_mutex_destroy(&os->mmap_mutex);
 	free(os);
 }
 
@@ -808,9 +942,8 @@ static int create_os(const char *slave_path, size_t stream_size,
 		     struct ossp_stream **osp)
 {
 	static pthread_mutex_t create_mutex = PTHREAD_MUTEX_INITIALIZER;
-	int cmd_tx_pipe[2] = { -1, -1 };
-	int cmd_rx_pipe[2] = { -1, -1 };
-	int notify_pipe[2] = { -1, -1 };
+	int cmd_sock[2] = { -1, -1 };
+	int notify_sock[2] = { -1, -1 };
 	struct ossp_stream *os = NULL;
 	struct epoll_event ev = { };
 	int i, rc;
@@ -821,16 +954,17 @@ static int create_os(const char *slave_path, size_t stream_size,
 	 */
 	pthread_mutex_lock(&create_mutex);
 
-	/* prepare pipes */
-	if (pipe(cmd_tx_pipe) || pipe(cmd_rx_pipe) || pipe(notify_pipe)) {
+	/* prepare communication channels */
+	if (socketpair(AF_UNIX, SOCK_STREAM, 0, cmd_sock) ||
+	    socketpair(AF_UNIX, SOCK_STREAM, 0, notify_sock)) {
 		rc = -errno;
-		warn_ose(os, rc, "failed to create slave command pipe");
+		warn_ose(os, rc, "failed to create slave command channel");
 		goto close_all;
 	}
 
-	if (fcntl(notify_pipe[0], F_SETFL, O_NONBLOCK) < 0) {
+	if (fcntl(notify_sock[0], F_SETFL, O_NONBLOCK) < 0) {
 		rc = -errno;
-		warn_ose(os, rc, "failed to set NONBLOCK on notify pipe");
+		warn_ose(os, rc, "failed to set NONBLOCK on notify sock");
 		goto close_all;
 	}
 
@@ -838,8 +972,8 @@ static int create_os(const char *slave_path, size_t stream_size,
 	 * Alloc stream which will be responsible for all server side
 	 * resources from now on.
 	 */
-	rc = alloc_os(stream_size, pid, pgrp, uid, gid,
-		      cmd_tx_pipe[1], cmd_rx_pipe[0], notify_pipe, &os);
+	rc = alloc_os(stream_size, pid, pgrp, uid, gid, cmd_sock[0],
+		      notify_sock, &os);
 	if (rc) {
 		warn_e(rc, "failed to allocate stream for %d", pid);
 		goto close_all;
@@ -859,10 +993,10 @@ static int create_os(const char *slave_path, size_t stream_size,
 	pthread_mutex_unlock(&mutex);
 
 	ev.events = EPOLLIN;
-	ev.data.fd = notify_pipe[0];
-	if (epoll_ctl(notify_epfd, EPOLL_CTL_ADD, notify_pipe[0], &ev)) {
+	ev.data.fd = notify_sock[0];
+	if (epoll_ctl(notify_epfd, EPOLL_CTL_ADD, notify_sock[0], &ev)) {
 		/*
-		 * Without poller watching this notify pipe, poller
+		 * Without poller watching this notify sock, poller
 		 * shutdown sequence in shutdown_notification() can't
 		 * be used.  Kill notification rx manually.
 		 */
@@ -883,15 +1017,13 @@ static int create_os(const char *slave_path, size_t stream_size,
 
 	if (os->slave_pid == 0) {
 		/* child */
-		char fd_str[3][16], log_str[16], slave_path_copy[PATH_MAX];
+		char fd_str[2][16], log_str[16], slave_path_copy[PATH_MAX];
 		char *argv[] = { slave_path_copy, "-c", fd_str[0],
-				 "-r", fd_str[1], "-n", fd_str[2],
-				 "-l", log_str, NULL, NULL };
+				 "-n", fd_str[1], "-l", log_str, NULL, NULL };
 		struct passwd *pwd;
 
 		/* drop stuff we don't need */
-		if (close(cmd_tx_pipe[1]) || close(cmd_rx_pipe[0]) ||
-		    close(notify_pipe[0]))
+		if (close(cmd_sock[0]) || close(notify_sock[0]))
 			fatal_e(-errno, "failed to close server pipe fds");
 
 		if (setresgid(os->gid, os->gid, os->gid) ||
@@ -901,8 +1033,9 @@ static int create_os(const char *slave_path, size_t stream_size,
 		clearenv();
 		pwd = getpwuid(os->uid);
 		if (pwd) {
-			setenv("USER", pwd->pw_name,1);
-			setenv("HOME", pwd->pw_dir,1);
+			setenv("LOGNAME", pwd->pw_name, 1);
+			setenv("USER", pwd->pw_name, 1);
+			setenv("HOME", pwd->pw_dir, 1);
 		}
 
 		/* prep and exec */
@@ -914,9 +1047,8 @@ static int create_os(const char *slave_path, size_t stream_size,
 			goto child_fail;
 		}
 
-		snprintf(fd_str[0], sizeof(fd_str[0]), "%d", cmd_tx_pipe[0]);
-		snprintf(fd_str[1], sizeof(fd_str[1]), "%d", cmd_rx_pipe[1]);
-		snprintf(fd_str[2], sizeof(fd_str[2]), "%d", notify_pipe[1]);
+		snprintf(fd_str[0], sizeof(fd_str[0]), "%d", cmd_sock[1]);
+		snprintf(fd_str[1], sizeof(fd_str[1]), "%d", notify_sock[1]);
 		snprintf(log_str, sizeof(log_str), "%d", ossp_log_level);
 		if (ossp_log_timestamp)
 			argv[ARRAY_SIZE(argv) - 2] = "-t";
@@ -930,7 +1062,6 @@ static int create_os(const char *slave_path, size_t stream_size,
 
 	/* turn on CLOEXEC on all server side fds */
 	if (fcntl(os->cmd_fd, F_SETFD, FD_CLOEXEC) < 0 ||
-	    fcntl(os->reply_fd, F_SETFD, FD_CLOEXEC) < 0 ||
 	    fcntl(os->notify_tx, F_SETFD, FD_CLOEXEC) < 0 ||
 	    fcntl(os->notify_rx, F_SETFD, FD_CLOEXEC) < 0) {
 		rc = -errno;
@@ -939,35 +1070,33 @@ static int create_os(const char *slave_path, size_t stream_size,
 	}
 
 	dbg0_os(os, "CREATE slave=%d %s", os->slave_pid, slave_path);
-	dbg0_os(os, "  client=%d cmd_tx=%d:%d cmd_rx=%d:%d notify=%d:%d",
-		pid, cmd_tx_pipe[0], cmd_tx_pipe[1],
-		cmd_rx_pipe[0], cmd_rx_pipe[1], notify_pipe[0], notify_pipe[1]);
+	dbg0_os(os, "  client=%d cmd=%d:%d notify=%d:%d",
+		pid, cmd_sock[0], cmd_sock[1], notify_sock[0], notify_sock[1]);
 
 	*osp = os;
 	rc = 0;
 	goto close_client_fds;
 
- put_os:
+put_os:
 	put_os(os);
- close_client_fds:
-	close(cmd_tx_pipe[0]);
-	close(cmd_rx_pipe[1]);
+close_client_fds:
+	close(cmd_sock[1]);
 	pthread_mutex_unlock(&create_mutex);
 	return rc;
 
- close_all:
+close_all:
 	for (i = 0; i < 2; i++) {
-		close(cmd_tx_pipe[i]);
-		close(cmd_rx_pipe[i]);
-		close(notify_pipe[i]);
+		close(cmd_sock[i]);
+		close(notify_sock[i]);
 	}
 	pthread_mutex_unlock(&create_mutex);
 	return rc;
 }
 
-static int dsp_open(const char *path, struct fuse_file_info *fi)
+static void dsp_open_common(fuse_req_t req, struct fuse_file_info *fi,
+			    struct fuse_session *se)
 {
-	struct fuse_context *fuse_cxt = fuse_get_context();
+	const struct fuse_ctx *fuse_ctx = fuse_req_ctx(req);
 	struct ossp_dsp_open_arg arg = { };
 	struct ossp_stream *os = NULL;
 	struct ossp_mixer *mixer;
@@ -976,17 +1105,17 @@ static int dsp_open(const char *path, struct fuse_file_info *fi)
 	pid_t pgrp;
 	ssize_t ret;
 
-	ret = get_proc_self_info(fuse_cxt->pid, &pgrp, NULL, 0);
+	ret = get_proc_self_info(fuse_ctx->pid, &pgrp, NULL, 0);
 	if (ret) {
-		err_e(ret, "get_proc_self_info(%d) failed", fuse_cxt->pid);
-		return ret;
+		err_e(ret, "get_proc_self_info(%d) failed", fuse_ctx->pid);
+		goto err;
 	}
 
-	ret = create_os(dsp_slave_path, sizeof(*dsps), fuse_cxt->pid, pgrp,
-			fuse_cxt->uid, fuse_cxt->gid, &os);
+	ret = create_os(dsp_slave_path, sizeof(*dsps), fuse_ctx->pid, pgrp,
+			fuse_ctx->uid, fuse_ctx->gid, &os);
 	if (ret)
-		return ret;
-	os->fuse = fuse_cxt->fuse;
+		goto err;
+	os->se = se;
 	dsps = os_to_dsps(os);
 	mixer = os->mixer;
 
@@ -995,7 +1124,7 @@ static int dsp_open(const char *path, struct fuse_file_info *fi)
 	ret = exec_simple_cmd(&dsps->os, OSSP_DSP_OPEN, &arg, NULL);
 	if (ret < 0) {
 		put_os(os);
-		return ret;
+		goto err;
 	}
 
 	if (mixer->vol[PLAY][0] >= 0 || mixer->vol[REC][0] >= 0) {
@@ -1009,73 +1138,133 @@ static int dsp_open(const char *path, struct fuse_file_info *fi)
 	fi->nonseekable = 1;
 	fi->fh = os->id;
 
-	return 0;
+	fuse_reply_open(req, fi);
+	return;
+
+err:
+	fuse_reply_err(req, -ret);
 }
 
-static int dsp_release(const char *path, struct fuse_file_info *fi)
+static void dsp_open(fuse_req_t req, struct fuse_file_info *fi)
+{
+	dsp_open_common(req, fi, dsp_se);
+}
+
+static void adsp_open(fuse_req_t req, struct fuse_file_info *fi)
+{
+	dsp_open_common(req, fi, adsp_se);
+}
+
+static void dsp_release(fuse_req_t req, struct fuse_file_info *fi)
 {
 	struct ossp_stream *os;
 
 	os = find_os(fi->fh);
-	if (!os)
-		return -EBADF;
-	put_os(os);
-	return 0;
+	if (os) {
+		put_os(os);
+		fuse_reply_err(req, 0);
+	} else
+		fuse_reply_err(req, EBADF);
 }
 
-static int dsp_read(const char *path, char *buf, size_t size, off_t off,
-		    struct fuse_file_info *fi)
-{
-	struct ossp_dsp_rw_arg arg = { };
-	struct ossp_stream *os;
-
-	os = find_os(fi->fh);
-	if (!os)
-		return -EBADF;
-
-	if (os_to_dsps(os)->nonblock_set)
-		arg.nonblock = os_to_dsps(os)->nonblock;
-	else
-		arg.nonblock = fi->nonblock;
-
-	return exec_cmd(os, OSSP_DSP_READ, &arg, sizeof(arg),
-			NULL, 0, NULL, 0, buf, &size);
-}
-
-static int dsp_write(const char *path, const char *buf, size_t size, off_t off,
+static void dsp_read(fuse_req_t req, size_t size, off_t off,
 		     struct fuse_file_info *fi)
 {
 	struct ossp_dsp_rw_arg arg = { };
 	struct ossp_stream *os;
+	struct ossp_dsp_stream *dsps;
+	void *buf = NULL;
+	ssize_t ret;
 
+	ret = -EBADF;
 	os = find_os(fi->fh);
 	if (!os)
-		return -EBADF;
+		goto out;
+	dsps = os_to_dsps(os);
 
-	arg.nonblock = fi->nonblock || os_to_dsps(os)->nonblock;
+	ret = -EIO;
+	if (dsps->mmapped)
+		goto out;
 
-	return exec_cmd(os, OSSP_DSP_WRITE, &arg, sizeof(arg),
-			buf, size, NULL, 0, NULL, NULL);
+	ret = -ENOMEM;
+	buf = malloc(size);
+	if (!buf)
+		goto out;
+
+	arg.nonblock = (fi->flags & O_NONBLOCK) || dsps->nonblock;
+
+	ret = exec_cmd(os, OSSP_DSP_READ, &arg, sizeof(arg),
+		       NULL, 0, NULL, 0, buf, &size, -1);
+out:
+	if (ret >= 0)
+		fuse_reply_buf(req, buf, size);
+	else
+		fuse_reply_err(req, -ret);
+
+	free(buf);
 }
 
-static int dsp_poll(const char *path, struct fuse_file_info *fi,
-		    unsigned int flags, unsigned *reventsp)
+static void dsp_write(fuse_req_t req, const char *buf, size_t size, off_t off,
+		      struct fuse_file_info *fi)
 {
-	int notify = !!(flags & FUSE_POLL_SCHEDULE_NOTIFY);
+	struct ossp_dsp_rw_arg arg = { };
 	struct ossp_stream *os;
+	struct ossp_dsp_stream *dsps;
+	ssize_t ret;
 
+	ret = -EBADF;
 	os = find_os(fi->fh);
 	if (!os)
-		return -EBADF;
+		goto out;
+	dsps = os_to_dsps(os);
 
-	return exec_simple_cmd(os, OSSP_DSP_POLL, &notify, reventsp);
+	ret = -EIO;
+	if (dsps->mmapped)
+		goto out;
+
+	arg.nonblock = (fi->flags & O_NONBLOCK) || dsps->nonblock;
+
+	ret = exec_cmd(os, OSSP_DSP_WRITE, &arg, sizeof(arg),
+		       buf, size, NULL, 0, NULL, NULL, -1);
+out:
+	if (ret >= 0)
+		fuse_reply_write(req, ret);
+	else
+		fuse_reply_err(req, -ret);
 }
 
-static int dsp_ioctl(const char *path, int signed_cmd, void *uarg,
-		     struct fuse_file_info *fi, unsigned *flagsp,
-		     const void *in_buf, size_t in_bufsz,
-		     void *out_buf, size_t *out_bufszp,
-		     struct iovec *in_iov, struct iovec *out_iov)
+static void dsp_poll(fuse_req_t req, struct fuse_file_info *fi,
+		     struct fuse_pollhandle *ph)
+{
+	int notify = ph != NULL;
+	unsigned revents = 0;
+	struct ossp_stream *os;
+	ssize_t ret;
+
+	ret = -EBADF;
+	os = find_os(fi->fh);
+	if (!os)
+		goto out;
+
+	if (ph) {
+		pthread_mutex_lock(&mutex);
+		if (os->ph)
+			fuse_pollhandle_destroy(os->ph);
+		os->ph = ph;
+		pthread_mutex_unlock(&mutex);
+	}
+
+	ret = exec_simple_cmd(os, OSSP_DSP_POLL, &notify, &revents);
+out:
+	if (ret >= 0)
+		fuse_reply_poll(req, revents);
+	else
+		fuse_reply_err(req, -ret);
+}
+
+static void dsp_ioctl(fuse_req_t req, int signed_cmd, void *uarg,
+		      struct fuse_file_info *fi, unsigned int flags,
+		      const void *in_buf, size_t in_bufsz, size_t out_bufsz)
 {
 	/* some ioctl constants are long and has the highest bit set */
 	unsigned cmd = signed_cmd;
@@ -1085,45 +1274,45 @@ static int dsp_ioctl(const char *path, int signed_cmd, void *uarg,
 	ssize_t ret;
 	int i;
 
+	ret = -EBADF;
 	os = find_os(fi->fh);
 	if (!os)
-		return -EBADF;
+		goto err;
 	dsps = os_to_dsps(os);
 
-	/* no compat yet */
-	if (*flagsp & FUSE_IOCTL_COMPAT)
-		return -ENOSYS;
-
 	/* mixer commands are allowed on DSP devices */
-	if (((cmd >> 8) & 0xff) == 'M')
-		return mixer_do_ioctl(os->mixer, cmd, uarg, flagsp,
-				      in_buf, in_bufsz, out_buf, out_bufszp,
-				      in_iov, out_iov);
+	if (((cmd >> 8) & 0xff) == 'M') {
+		mixer_do_ioctl(req, os->mixer, cmd, uarg, in_buf, in_bufsz,
+			       out_bufsz);
+		return;
+	}
 
 	/* and the rest */
 	switch (cmd) {
 	case OSS_GETVERSION:
 		i = SNDRV_OSS_VERSION;
 		PREP_UARG(NULL, &i);
-		PUT_UARG(&i);
-		return 0;
+		IOCTL_RETURN(0, &i);
 
 	case SNDCTL_DSP_GETCAPS:
 		i = DSP_CAP_DUPLEX | DSP_CAP_REALTIME | DSP_CAP_TRIGGER |
-			DSP_CAP_MULTI;
+			DSP_CAP_MULTI | DSP_CAP_MMAP;
 		PREP_UARG(NULL, &i);
-		PUT_UARG(&i);
-		return 0;
+		IOCTL_RETURN(0, &i);
 
 	case SNDCTL_DSP_NONBLOCK:
 		dsps->nonblock = 1;
-		return 0;
+		ret = 0;
+		IOCTL_RETURN(0, NULL);
 
 	case SNDCTL_DSP_RESET:		op = OSSP_DSP_RESET;		goto nd;
 	case SNDCTL_DSP_SYNC:		op = OSSP_DSP_SYNC;		goto nd;
 	case SNDCTL_DSP_POST:		op = OSSP_DSP_POST;		goto nd;
 	nd:
-		return exec_simple_cmd(&dsps->os, op, NULL, NULL);
+		ret = exec_simple_cmd(&dsps->os, op, NULL, NULL);
+		if (ret)
+			goto err;
+		IOCTL_RETURN(0, NULL);
 
 	case SOUND_PCM_READ_RATE:	op = OSSP_DSP_GET_RATE;		goto ri;
 	case SOUND_PCM_READ_BITS:	op = OSSP_DSP_GET_FORMAT;	goto ri;
@@ -1134,9 +1323,9 @@ static int dsp_ioctl(const char *path, int signed_cmd, void *uarg,
 	ri:
 		PREP_UARG(NULL, &i);
 		ret = exec_simple_cmd(&dsps->os, op, NULL, &i);
-		if (ret == 0)
-			PUT_UARG(&i);
-		return ret;
+		if (ret)
+			goto err;
+		IOCTL_RETURN(0, &i);
 
 	case SNDCTL_DSP_SPEED:		op = OSSP_DSP_SET_RATE;		goto wi;
 	case SNDCTL_DSP_SETFMT:		op = OSSP_DSP_SET_FORMAT;	goto wi;
@@ -1145,28 +1334,34 @@ static int dsp_ioctl(const char *path, int signed_cmd, void *uarg,
 	wi:
 		PREP_UARG(&i, &i);
 		ret = exec_simple_cmd(&dsps->os, op, &i, &i);
-		if (ret == 0)
-			PUT_UARG(&i);
-		return ret;
+		if (ret)
+			goto err;
+		IOCTL_RETURN(0, &i);
 
 	case SNDCTL_DSP_STEREO:
 		PREP_UARG(NULL, &i);
 		i = 2;
 		ret = exec_simple_cmd(&dsps->os, OSSP_DSP_SET_CHANNELS, &i, &i);
 		i--;
-		if (ret == 0)
-			PUT_UARG(&i);
-		return ret;
+		if (ret)
+			goto err;
+		IOCTL_RETURN(0, &i);
 
 	case SNDCTL_DSP_SETFRAGMENT:
 		PREP_UARG(&i, NULL);
-		return exec_simple_cmd(&dsps->os,
-				       OSSP_DSP_SET_FRAGMENT, &i, NULL);
+		ret = exec_simple_cmd(&dsps->os,
+				      OSSP_DSP_SET_FRAGMENT, &i, NULL);
+		if (ret)
+			goto err;
+		IOCTL_RETURN(0, NULL);
 
 	case SNDCTL_DSP_SETTRIGGER:
 		PREP_UARG(&i, NULL);
-		return exec_simple_cmd(&dsps->os,
-				       OSSP_DSP_SET_TRIGGER, &i, NULL);
+		ret = exec_simple_cmd(&dsps->os,
+				      OSSP_DSP_SET_TRIGGER, &i, NULL);
+		if (ret)
+			goto err;
+		IOCTL_RETURN(0, NULL);
 
 	case SNDCTL_DSP_GETOSPACE:
 	case SNDCTL_DSP_GETISPACE: {
@@ -1176,9 +1371,9 @@ static int dsp_ioctl(const char *path, int signed_cmd, void *uarg,
 						 : OSSP_DSP_GET_ISPACE;
 		PREP_UARG(NULL, &info);
 		ret = exec_simple_cmd(&dsps->os, op, NULL, &info);
-		if (ret == 0)
-			PUT_UARG(&info);
-		return ret;
+		if (ret)
+			goto err;
+		IOCTL_RETURN(0, &info);
 	}
 
 	case SNDCTL_DSP_GETOPTR:
@@ -1189,35 +1384,40 @@ static int dsp_ioctl(const char *path, int signed_cmd, void *uarg,
 					       : OSSP_DSP_GET_IPTR;
 		PREP_UARG(NULL, &info);
 		ret = exec_simple_cmd(&dsps->os, op, NULL, &info);
-		if (ret == 0)
-			PUT_UARG(&info);
-		return ret;
+		if (ret)
+			goto err;
+		IOCTL_RETURN(0, &info);
 	}
 
 	case SNDCTL_DSP_GETODELAY:
 		PREP_UARG(NULL, &i);
 		i = 0;
 		ret = exec_simple_cmd(&dsps->os, OSSP_DSP_GET_ODELAY, NULL, &i);
-		PUT_UARG(&i);	/* always put, 0 on failure */
-		return ret;
+		IOCTL_RETURN(ret, &i);	/* always copy out result, 0 on err */
 
 	case SOUND_PCM_WRITE_FILTER:
 	case SOUND_PCM_READ_FILTER:
-		return -EIO;
+		ret = -EIO;
+		goto err;
 
 	case SNDCTL_DSP_MAPINBUF:
 	case SNDCTL_DSP_MAPOUTBUF:
-		return -EINVAL;
+		ret = -EINVAL;
+		goto err;
 
 	case SNDCTL_DSP_SETSYNCRO:
 	case SNDCTL_DSP_SETDUPLEX:
 	case SNDCTL_DSP_PROFILE:
-		return 0;
+		IOCTL_RETURN(0, NULL);
 
 	default:
 		warn_os(os, "unknown ioctl 0x%x", cmd);
-		return -EINVAL;
+		ret = -EINVAL;
+		goto err;
 	}
+	assert(0);	/* control shouldn't reach here */
+err:
+	fuse_reply_err(req, -ret);
 }
 
 
@@ -1230,7 +1430,7 @@ static void *notify_poller(void *arg)
 	struct epoll_event events[1024];
 	int i, nfds;
 
- repeat:
+repeat:
 	nfds = epoll_wait(notify_epfd, events, ARRAY_SIZE(events), -1);
 	for (i = 0; i < nfds; i++) {
 		int do_notify = 0;
@@ -1296,10 +1496,18 @@ static void *notify_poller(void *arg)
 			os->dead = 1;
 		}
 
-		if (do_notify || os->dead)
-			fuse_notify_poll(os->fuse, os->id);
+		if (!do_notify && !os->dead)
+			continue;
+
+		pthread_mutex_lock(&mutex);
+
+		if (os->ph) {
+			fuse_lowlevel_notify_poll(os->ph);
+			fuse_pollhandle_destroy(os->ph);
+			os->ph = NULL;
+		}
+
 		if (os->dead) {
-			pthread_mutex_lock(&mutex);
 			dbg0_os(os, "removing %d from notify poll list",
 				os->notify_rx);
 			epoll_ctl(notify_epfd, EPOLL_CTL_DEL, os->notify_rx,
@@ -1307,10 +1515,124 @@ static void *notify_poller(void *arg)
 			close(os->notify_rx);
 			os->notify_rx = -1;
 			pthread_cond_broadcast(&notify_poller_kill_wait);
-			pthread_mutex_unlock(&mutex);
 		}
+
+		pthread_mutex_unlock(&mutex);
 	}
 	goto repeat;
+}
+
+static int dsp_mmap_dir(int prot)
+{
+	if (!(prot & PROT_WRITE))
+		return REC;
+	return PLAY;
+}
+
+static void dsp_mmap(fuse_req_t req, void *addr, size_t len, int prot,
+		     int flags, off_t offset, struct fuse_file_info *fi)
+{
+	int dir = dsp_mmap_dir(prot);
+	int fd = -1;
+	struct ossp_stream *os;
+	struct ossp_dsp_stream *dsps;
+
+	os = find_os(fi->fh);
+	if (!os) {
+		fuse_reply_err(req, EBADF);
+		return;
+	}
+	dsps = os_to_dsps(os);
+
+	if (dsps->nr_mmaps[dir])
+		fd = dsps->mmap_fd[dir];
+
+	fuse_reply_mmap(req, fd, FUSE_MMAP_DONT_COPY | FUSE_MMAP_DONT_EXPAND);
+}
+
+static void dsp_mmap_commit(fuse_req_t req, void *addr, size_t len, int prot,
+			    int flags, int fd, off_t offset,
+			    struct fuse_file_info *fi, uint64_t mmap_unique)
+{
+	int dir = dsp_mmap_dir(prot);
+	struct ossp_dsp_mmap_arg arg = { .dir = dir, .size = offset + len };
+	struct ossp_stream *os;
+	struct ossp_dsp_stream *dsps;
+	int rc;
+
+	rc = 0;
+	if (fd < 0)
+		goto out;
+
+	rc = -EOVERFLOW;
+	if (arg.size < offset)
+		goto out;
+
+	rc = -EBADF;
+	os = find_os(fi->fh);
+	if (!os)
+		goto out;
+	dsps = os_to_dsps(os);
+
+	pthread_mutex_lock(&os->mmap_mutex);
+
+	if (dsps->nr_mmaps[dir]) {
+		rc = 0;
+		if (dsps->mmap_fd[dir] != fd)
+			rc = -EBUSY;
+		goto out_unlock;
+	}
+
+	rc = exec_cmd(os, OSSP_DSP_MMAP, &arg, sizeof(arg), NULL, 0, NULL, 0,
+		      NULL, NULL, fd);
+	if (rc)
+		goto out_unlock;
+
+	dsps->nr_mmaps[dir]++;
+	dsps->mmap_fd[dir] = fd;
+	dsps->mmapped = 1;
+
+out_unlock:
+	pthread_mutex_unlock(&os->mmap_mutex);
+out:
+	fuse_reply_err(req, -rc);
+}
+
+static void dsp_munmap(fuse_req_t req, void *addr, size_t len,
+		       struct fuse_file_info *fi, uint64_t mmap_unique, int fd)
+{
+	struct ossp_stream *os;
+	struct ossp_dsp_stream *dsps;
+	int dir, rc;
+
+	os = find_os(fi->fh);
+	if (!os)
+		goto out;
+	dsps = os_to_dsps(os);
+
+	pthread_mutex_lock(&os->mmap_mutex);
+
+	for (dir = 0; dir < 2; dir++)
+		if (dsps->nr_mmaps[dir] && dsps->mmap_fd[dir] == fd)
+			break;
+	if (dir == 2) {
+		warn_os(os, "invalid munmap request for fd %d (%d:%d %d:%d)\n",
+			fd, dsps->nr_mmaps[PLAY], dsps->mmap_fd[PLAY],
+			dsps->nr_mmaps[REC], dsps->mmap_fd[REC]);
+		goto out_unlock;
+	}
+
+	if (--dsps->nr_mmaps[dir])
+		goto out_unlock;
+
+	rc = exec_simple_cmd(os, OSSP_DSP_MUNMAP, &dir, NULL);
+	if (rc)
+		warn_ose(os, rc, "MUNMAP failed for dir=%d fd=%d\n", dir, fd);
+
+out_unlock:
+	pthread_mutex_unlock(&os->mmap_mutex);
+out:
+	fuse_reply_none(req);
 }
 
 
@@ -1318,19 +1640,102 @@ static void *notify_poller(void *arg)
  * Stuff to bind and start everything
  */
 
-static const struct cuse_operations mixer_ops = {
-	.open		= mixer_open,
-	.release	= mixer_release,
-	.ioctl		= mixer_ioctl,
+static void ossp_daemonize(void)
+{
+	int fd, pfd[2];
+	pid_t pid;
+	ssize_t ret;
+	int err;
+
+	fd = open("/dev/null", O_RDWR);
+	if (fd >= 0) {
+		dup2(fd, 0);
+		dup2(fd, 1);
+		dup2(fd, 2);
+		if (fd > 2)
+			close(fd);
+	}
+
+	if (pipe(pfd))
+		fatal_e(-errno, "failed to create pipe for init wait");
+
+	if (fcntl(pfd[0], F_SETFD, FD_CLOEXEC) < 0 ||
+	    fcntl(pfd[1], F_SETFD, FD_CLOEXEC) < 0)
+		fatal_e(-errno, "failed to set CLOEXEC on init wait pipe");
+
+	pid = fork();
+	if (pid < 0)
+		fatal_e(-errno, "failed to fork for daemon");
+
+	if (pid == 0) {
+		close(pfd[0]);
+		init_wait_fd = pfd[1];
+
+		/* be evil, my child */
+		chdir("/");
+		setsid();
+		return;
+	}
+
+	/* wait for init completion and pass over success indication */
+	close(pfd[1]);
+
+	do {
+		ret = read(pfd[0], &err, sizeof(err));
+	} while (ret < 0 && errno == EINTR);
+
+	if (ret == sizeof(err) && err == 0)
+		exit(0);
+
+	fatal("daemon init failed ret=%zd err=%d\n", ret, err);
+	exit(1);
+}
+
+static void ossp_init_done(void *userdata)
+{
+	/* init complete, notify parent if it's waiting */
+	if (init_wait_fd >= 0) {
+		ssize_t ret;
+		int err = 0;
+
+		ret = write(init_wait_fd, &err, sizeof(err));
+		if (ret != sizeof(err))
+			fatal_e(-errno, "failed to notify init completion, "
+				"ret=%zd", ret);
+		close(init_wait_fd);
+		init_wait_fd = -1;
+	}
+}
+
+static const struct cuse_lowlevel_ops mixer_ops = {
+	.open			= mixer_open,
+	.release		= mixer_release,
+	.ioctl			= mixer_ioctl,
 };
 
-static const struct cuse_operations dsp_ops = {
-	.open		= dsp_open,
-	.release	= dsp_release,
-	.read		= dsp_read,
-	.write		= dsp_write,
-	.poll		= dsp_poll,
-	.ioctl		= dsp_ioctl,
+static const struct cuse_lowlevel_ops dsp_ops = {
+	.init_done		= ossp_init_done,
+	.open			= dsp_open,
+	.release		= dsp_release,
+	.read			= dsp_read,
+	.write			= dsp_write,
+	.poll			= dsp_poll,
+	.ioctl			= dsp_ioctl,
+	.mmap			= dsp_mmap,
+	.mmap_commit		= dsp_mmap_commit,
+	.munmap			= dsp_munmap,
+};
+
+static const struct cuse_lowlevel_ops adsp_ops = {
+	.open			= adsp_open,
+	.release		= dsp_release,
+	.read			= dsp_read,
+	.write			= dsp_write,
+	.poll			= dsp_poll,
+	.ioctl			= dsp_ioctl,
+	.mmap			= dsp_mmap,
+	.mmap_commit		= dsp_mmap_commit,
+	.munmap			= dsp_munmap,
 };
 
 static const char *usage =
@@ -1349,6 +1754,7 @@ static const char *usage =
 "    --mixer-min=MIN   mixer device minor number (default 0)\n"
 "    --max=MAX         maximum number of open streams (default 256)\n"
 "    --umax=MAX        maximum number of open streams per UID (default --max)\n"
+"    --exit-on-idle    exit if idle\n"
 "    --dsp-slave=PATH  DSP slave (default ossp-padsp in the same dir)\n"
 "    --log=LEVEL       log level (0..6)\n"
 "    --timestamp       timestamp log messages\n"
@@ -1370,6 +1776,7 @@ struct ossp_param {
 	unsigned		umax_streams;
 	char			*dsp_slave_path;
 	unsigned		log_level;
+	int			exit_on_idle;
 	int			timestamp;
 	int			fg;
 	int			help;
@@ -1389,6 +1796,7 @@ static const struct fuse_opt ossp_opts[] = {
 	OSSP_OPT("--mixer-min=%u",	mixer_minor),
 	OSSP_OPT("--max=%u",		max_streams),
 	OSSP_OPT("--umax=%u",		umax_streams),
+	OSSP_OPT("--exit-on-idle",	exit_on_idle),
 	OSSP_OPT("--dsp-slave=%s",	dsp_slave_path),
 	OSSP_OPT("--timestamp",		timestamp),
 	OSSP_OPT("--log=%u",		log_level),
@@ -1399,57 +1807,43 @@ static const struct fuse_opt ossp_opts[] = {
 	FUSE_OPT_END
 };
 
-struct ossp_cuse_data {
-	char name_buf[128];
-	struct cuse_operations ops;
-	char *dinfo_argv[1];
-	char *hinfo_argv[1];
-};
-
-static struct fuse *setup_ossp_cuse(const struct cuse_operations *base_ops,
-				    const char *name, int major, int minor,
-				    int argc, char **argv)
+static struct fuse_session *setup_ossp_cuse(const struct cuse_lowlevel_ops *ops,
+					    const char *name, int major,
+					    int minor, int argc, char **argv)
 {
-	struct ossp_cuse_data *data;
-	struct fuse *fuse;
+	char name_buf[128];
+	const char *bufp = name_buf;
+	struct cuse_info ci = { .dev_major = major, .dev_minor = minor,
+				.dev_info_argc = 1, .dev_info_argv = &bufp,
+				.flags = CUSE_UNRESTRICTED_IOCTL };
+	struct fuse_session *se;
 	int fd;
 
-	data = calloc(1, sizeof(*data));
-	snprintf(data->name_buf, sizeof(data->name_buf), "DEVNAME=%s", name);
-	data->dinfo_argv[0] = data->name_buf;
-	data->hinfo_argv[0] = "SUBSYSTEM=sound";
+	snprintf(name_buf, sizeof(name_buf), "DEVNAME=%s", name);
 
-	data->ops = *base_ops;
-	data->ops.dev_major = major;
-	data->ops.dev_minor = minor;
-	data->ops.dev_info_argc = ARRAY_SIZE(data->dinfo_argv);
-	data->ops.dev_info_argv = (const char **)data->dinfo_argv;
-	data->ops.hotplug_info_argc = ARRAY_SIZE(data->hinfo_argv);
-	data->ops.hotplug_info_argv = (const char **)data->hinfo_argv;
-
-	fuse = cuse_setup(argc, argv, &data->ops, NULL, NULL);
-	if (!fuse) {
+	se = cuse_lowlevel_setup(argc, argv, &ci, ops, NULL, NULL);
+	if (!se) {
 		err("failed to setup %s CUSE", name);
 		return NULL;
 	}
 
-	fd = fuse_chan_fd(fuse_session_next_chan(fuse_get_session(fuse), NULL));
+	fd = fuse_chan_fd(fuse_session_next_chan(se, NULL));
 	if (fcntl(fd, F_SETFD, FD_CLOEXEC) < 0) {
 		err_e(-errno, "failed to set CLOEXEC on %s CUSE fd", name);
-		cuse_teardown(fuse);
+		cuse_lowlevel_teardown(se);
 		return NULL;
 	}
 
-	return fuse;
+	return se;
 }
 
 static void *cuse_worker(void *arg)
 {
-	struct fuse *fuse = arg;
+	struct fuse_session *se = arg;
 	int rc;
 
-	rc = fuse_loop_mt(fuse);
-	cuse_teardown(fuse);
+	rc = fuse_session_loop_mt(se);
+	cuse_lowlevel_teardown(se);
 
 	return (void *)(unsigned long)rc;
 }
@@ -1483,7 +1877,6 @@ int main(int argc, char **argv)
 		.max_streams = DFL_MAX_STREAMS,
 	};
 	struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
-	struct fuse *mixer_fuse = NULL, *dsp_fuse = NULL, *adsp_fuse = NULL;
 	char path_buf[PATH_MAX], *dir;
 	char adsp_buf[64] = "", mixer_buf[64] = "";
 	struct sigaction sa;
@@ -1513,13 +1906,13 @@ int main(int argc, char **argv)
 	ossp_log_level = param.log_level;
 	ossp_log_timestamp = param.timestamp;
 
-	if (!param.fg && daemon(0, 0))
-		fatal_e(-errno, "daemon() failed");
+	if (!param.fg)
+		ossp_daemonize();
 
 	/* daemonization already handled, prevent forking inside FUSE */
 	fuse_opt_add_arg(&args, "-f");
 
-	info("OSS Proxy v%s (C) 2008 by Tejun Heo <teheo@suse.de>",
+	info("OSS Proxy v%s (C) 2008-2009 by Tejun Heo <teheo@suse.de>",
 	     OSSP_VERSION);
 
 	/* we don't care about zombies and don't want stupid SIGPIPEs */
@@ -1570,6 +1963,23 @@ int main(int argc, char **argv)
 		INIT_LIST_HEAD(&os_notify_tbl[u]);
 	}
 
+	/* create mixer delayed reference worker */
+	ret = -pthread_create(&mixer_delayed_put_thread, NULL,
+			      mixer_delayed_put_worker, NULL);
+	if (ret)
+		fatal_e(ret, "failed to create mixer delayed put worker");
+
+	/* if exit_on_idle, touch mixer for pgrp0 */
+	exit_on_idle = param.exit_on_idle;
+	if (exit_on_idle) {
+		struct ossp_mixer *mixer;
+
+		mixer = get_mixer(0);
+		if (!mixer)
+			fatal("failed to touch idle mixer");
+		put_mixer(mixer);
+	}
+
 	/* create notify epoll and kick off watcher thread */
 	notify_epfd = epoll_create(max_streams);
 	if (notify_epfd < 0)
@@ -1583,24 +1993,24 @@ int main(int argc, char **argv)
 
 	/* we're set, let's setup fuse structures */
 	if (strlen(param.mixer_name))
-		mixer_fuse = setup_ossp_cuse(&mixer_ops, param.mixer_name,
-					     param.mixer_major, param.mixer_minor,
-					     args.argc, args.argv);
+		mixer_se = setup_ossp_cuse(&mixer_ops, param.mixer_name,
+					   param.mixer_major, param.mixer_minor,
+					   args.argc, args.argv);
 	if (strlen(param.adsp_name))
-		adsp_fuse = setup_ossp_cuse(&dsp_ops, param.adsp_name,
-					    param.adsp_major, param.adsp_minor,
-					    args.argc, args.argv);
+		adsp_se = setup_ossp_cuse(&dsp_ops, param.adsp_name,
+					  param.adsp_major, param.adsp_minor,
+					  args.argc, args.argv);
 
-	dsp_fuse = setup_ossp_cuse(&dsp_ops, param.dsp_name,
-				   param.dsp_major, param.dsp_minor,
-				   args.argc, args.argv);
-	if (!dsp_fuse)
+	dsp_se = setup_ossp_cuse(&dsp_ops, param.dsp_name,
+				 param.dsp_major, param.dsp_minor,
+				 args.argc, args.argv);
+	if (!dsp_se)
 		fatal("can't create dsp, giving up");
 
-	if (mixer_fuse)
+	if (mixer_se)
 		snprintf(mixer_buf, sizeof(mixer_buf), ", %s (%d:%d)",
 			 param.mixer_name, param.mixer_major, param.mixer_minor);
-	if (adsp_fuse)
+	if (adsp_se)
 		snprintf(adsp_buf, sizeof(adsp_buf), ", %s (%d:%d)",
 			 param.adsp_name, param.adsp_major, param.adsp_minor);
 
@@ -1608,21 +2018,21 @@ int main(int argc, char **argv)
 	     param.dsp_minor, adsp_buf, mixer_buf);
 
 	/* start threads for mixer and adsp */
-	if (mixer_fuse) {
+	if (mixer_se) {
 		ret = -pthread_create(&cuse_mixer_thread, NULL,
-				      cuse_worker, mixer_fuse);
+				      cuse_worker, mixer_se);
 		if (ret)
 			err_e(ret, "failed to create mixer worker");
 	}
-	if (adsp_fuse) {
+	if (adsp_se) {
 		ret = -pthread_create(&cuse_adsp_thread, NULL,
-				      cuse_worker, adsp_fuse);
+				      cuse_worker, adsp_se);
 		if (ret)
 			err_e(ret, "failed to create adsp worker");
 	}
 
 	/* run CUSE for /dev/dsp in the main thread */
-	ret = (ssize_t)cuse_worker(dsp_fuse);
+	ret = (ssize_t)cuse_worker(dsp_se);
 	if (ret < 0)
 		fatal("dsp worker failed");
 	return 0;

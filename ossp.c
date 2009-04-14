@@ -1,8 +1,8 @@
 /*
  * ossp - OSS Proxy: emulate OSS device using CUSE
  *
- * Copyright (C) 2008       SUSE Linux Products GmbH
- * Copyright (C) 2008       Tejun Heo <teheo@suse.de>
+ * Copyright (C) 2008-2009  SUSE Linux Products GmbH
+ * Copyright (C) 2008-2009  Tejun Heo <tj@kernel.org>
  *
  * This file is released under the GPLv2.
  */
@@ -11,33 +11,35 @@
 
 const struct ossp_arg_size ossp_arg_sizes[OSSP_NR_OPCODES] = {
 	[OSSP_MIXER]		= { sizeof(struct ossp_mixer_arg),
-				    sizeof(struct ossp_mixer_arg) },
+				    sizeof(struct ossp_mixer_arg), 0 },
 
-	[OSSP_DSP_OPEN]		= { sizeof(struct ossp_dsp_open_arg), 0 },
-	[OSSP_DSP_READ]		= { sizeof(struct ossp_dsp_rw_arg), 0 },
-	[OSSP_DSP_WRITE]	= { sizeof(struct ossp_dsp_rw_arg), 0 },
-	[OSSP_DSP_POLL]		= { sizeof(int), sizeof(unsigned) },
+	[OSSP_DSP_OPEN]		= { sizeof(struct ossp_dsp_open_arg), 0, 0 },
+	[OSSP_DSP_READ]		= { sizeof(struct ossp_dsp_rw_arg), 0, 0 },
+	[OSSP_DSP_WRITE]	= { sizeof(struct ossp_dsp_rw_arg), 0, 0 },
+	[OSSP_DSP_POLL]		= { sizeof(int), sizeof(unsigned), 0 },
+	[OSSP_DSP_MMAP]		= { sizeof(struct ossp_dsp_mmap_arg), 0, 1 },
+	[OSSP_DSP_MUNMAP]	= { sizeof(int), 0, 0 },
 
-	[OSSP_DSP_RESET]	= { 0, 0 },
-	[OSSP_DSP_SYNC]		= { 0, 0 },
-	[OSSP_DSP_POST]		= { 0, 0 },
-	[OSSP_DSP_GET_RATE]	= { 0, sizeof(int) },
-	[OSSP_DSP_GET_CHANNELS]	= { 0, sizeof(int) },
-	[OSSP_DSP_GET_FORMAT]	= { 0, sizeof(int) },
-	[OSSP_DSP_GET_BLKSIZE]	= { 0, sizeof(int) },
-	[OSSP_DSP_GET_FORMATS]	= { 0, sizeof(int) },
-	[OSSP_DSP_SET_RATE]	= { sizeof(int), sizeof(int) },
-	[OSSP_DSP_SET_CHANNELS]	= { sizeof(int), sizeof(int) },
-	[OSSP_DSP_SET_FORMAT]	= { sizeof(int), sizeof(int) },
-	[OSSP_DSP_SET_SUBDIVISION] = { sizeof(int), sizeof(int) },
-	[OSSP_DSP_SET_FRAGMENT]	= { sizeof(int), 0 },
-	[OSSP_DSP_GET_TRIGGER]	= { 0, sizeof(int) },
-	[OSSP_DSP_SET_TRIGGER]	= { sizeof(int), 0 },
-	[OSSP_DSP_GET_OSPACE]	= { 0, sizeof(struct audio_buf_info) },
-	[OSSP_DSP_GET_ISPACE]	= { 0, sizeof(struct audio_buf_info) },
-	[OSSP_DSP_GET_OPTR]	= { 0, sizeof(struct count_info) },
-	[OSSP_DSP_GET_IPTR]	= { 0, sizeof(struct count_info) },
-	[OSSP_DSP_GET_ODELAY]	= { 0, sizeof(int) },
+	[OSSP_DSP_RESET]	= { 0, 0, 0 },
+	[OSSP_DSP_SYNC]		= { 0, 0, 0 },
+	[OSSP_DSP_POST]		= { 0, 0, 0 },
+	[OSSP_DSP_GET_RATE]	= { 0, sizeof(int), 0 },
+	[OSSP_DSP_GET_CHANNELS]	= { 0, sizeof(int), 0 },
+	[OSSP_DSP_GET_FORMAT]	= { 0, sizeof(int), 0 },
+	[OSSP_DSP_GET_BLKSIZE]	= { 0, sizeof(int), 0 },
+	[OSSP_DSP_GET_FORMATS]	= { 0, sizeof(int), 0 },
+	[OSSP_DSP_SET_RATE]	= { sizeof(int), sizeof(int), 0 },
+	[OSSP_DSP_SET_CHANNELS]	= { sizeof(int), sizeof(int), 0 },
+	[OSSP_DSP_SET_FORMAT]	= { sizeof(int), sizeof(int), 0 },
+	[OSSP_DSP_SET_SUBDIVISION] = { sizeof(int), sizeof(int), 0 },
+	[OSSP_DSP_SET_FRAGMENT]	= { sizeof(int), 0, 0 },
+	[OSSP_DSP_GET_TRIGGER]	= { 0, sizeof(int), 0 },
+	[OSSP_DSP_SET_TRIGGER]	= { sizeof(int), 0, 0 },
+	[OSSP_DSP_GET_OSPACE]	= { 0, sizeof(struct audio_buf_info), 0 },
+	[OSSP_DSP_GET_ISPACE]	= { 0, sizeof(struct audio_buf_info), 0 },
+	[OSSP_DSP_GET_OPTR]	= { 0, sizeof(struct count_info), 0 },
+	[OSSP_DSP_GET_IPTR]	= { 0, sizeof(struct count_info), 0 },
+	[OSSP_DSP_GET_ODELAY]	= { 0, sizeof(int), 0 },
 };
 
 const char *ossp_cmd_str[OSSP_NR_OPCODES] = {
@@ -47,6 +49,8 @@ const char *ossp_cmd_str[OSSP_NR_OPCODES] = {
 	[OSSP_DSP_READ]		= "READ",
 	[OSSP_DSP_WRITE]	= "WRITE",
 	[OSSP_DSP_POLL]		= "POLL",
+	[OSSP_DSP_MMAP]		= "MMAP",
+	[OSSP_DSP_MUNMAP]	= "MUNMAP",
 
 	[OSSP_DSP_RESET]	= "RESET",
 	[OSSP_DSP_SYNC]		= "SYNC",

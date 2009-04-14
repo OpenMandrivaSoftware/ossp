@@ -1,8 +1,8 @@
 /*
  * ossp-util - OSS Proxy: Common utilities
  *
- * Copyright (C) 2008       SUSE Linux Products GmbH
- * Copyright (C) 2008       Tejun Heo <teheo@suse.de>
+ * Copyright (C) 2008-2009  SUSE Linux Products GmbH
+ * Copyright (C) 2008-2009  Tejun Heo <tj@kernel.org>
  *
  * This file is released under the GPLv2.
  */
@@ -10,6 +10,7 @@
 #ifndef _OSSP_UTIL_H
 #define _OSSP_UTIL_H
 
+#include <assert.h>
 #include <stddef.h>
 #include <string.h>
 #include <sys/types.h>
@@ -85,6 +86,47 @@ void log_msg(int severity, const char *fmt, ...)
 #define dbg1_e(e, fmt, args...)	\
 	dbg1(fmt" (%s)" , ##args, strerror(-(e)))
 
+struct ring_buf {
+	char		*buf;
+	size_t		size;
+	size_t		head;
+	size_t		bytes;
+};
+
+static inline size_t ring_size(struct ring_buf *ring)
+{
+	return ring->size;
+}
+
+static inline size_t ring_bytes(struct ring_buf *ring)
+{
+	return ring->bytes;
+}
+
+static inline size_t ring_space(struct ring_buf *ring)
+{
+	return ring->size - ring->bytes;
+}
+
+static inline void ring_consume(struct ring_buf *ring, size_t size)
+{
+	assert(ring->bytes >= size);
+	ring->bytes -= size;
+}
+
+static inline void ring_manual_init(struct ring_buf *ring, void *buf,
+				    size_t size, size_t head, size_t bytes)
+{
+	ring->buf = buf;
+	ring->size = size;
+	ring->head = head;
+	ring->bytes = bytes;
+}
+
+void ring_fill(struct ring_buf *ring, const void *buf, size_t size);
+void *ring_data(struct ring_buf *ring, size_t *sizep);
+int ring_resize(struct ring_buf *ring, size_t new_size);
+
 struct sized_buf {
 	char		*buf;
 	size_t		size;
@@ -97,12 +139,13 @@ int write_fill(int fd, const void *buf, size_t size);
 
 typedef ssize_t (*ossp_action_fn_t)(enum ossp_opcode opcode,
 				    void *carg, void *din, size_t din_sz,
-				    void *rarg, void *dout, size_t *dout_szp);
+				    void *rarg, void *dout, size_t *dout_szp,
+				    int fd);
 
 int get_proc_self_info(pid_t tid, pid_t *pgrp,
 		       char *cmd_buf, size_t cmd_buf_sz);
 
-int ossp_slave_process_command(int cmd_fd, int reply_fd,
+int ossp_slave_process_command(int cmd_fd,
 			       ossp_action_fn_t const *action_fn_tbl,
 			       int (*action_pre_fn)(void),
 			       void (*action_post_fn)(void));

@@ -1,8 +1,8 @@
 /*
  * ossp-padsp - ossp DSP slave which forwards to pulseaduio
  *
- * Copyright (C) 2008       SUSE Linux Products GmbH
- * Copyright (C) 2008       Tejun Heo <teheo@suse.de>
+ * Copyright (C) 2008-2009  SUSE Linux Products GmbH
+ * Copyright (C) 2008-2009  Tejun Heo <tj@kernel.org>
  *
  * This file is released under the GPLv2.
  */
@@ -20,6 +20,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -30,11 +31,38 @@
 #include "ossp.h"
 #include "ossp-util.h"
 
-#define AFMT_FLOAT       0x00004000
-#define AFMT_S32_LE      0x00001000
-#define AFMT_S32_BE      0x00002000
+enum {
+	AFMT_FLOAT		= 0x00004000,
+	AFMT_S32_LE		= 0x00001000,
+	AFMT_S32_BE		= 0x00002000,
+};
 
-static int cmd_fd = -1, reply_fd = -1, notify_fd = -1;
+/* everything is in millisecs */
+struct stream_params {
+	size_t		min_process;
+	size_t		min_latency;
+	size_t		dfl_process;
+	size_t		dfl_latency;
+	size_t		mmap_process;
+	size_t		mmap_latency;
+	size_t		mmap_lead;
+	size_t		mmap_staging;
+};
+
+/* TODO: make this configurable */
+static struct stream_params stream_params[] = {
+	[ PLAY ] = { .min_process = 25,		.min_latency = 100,
+		     .dfl_process = 50,		.dfl_latency = 200,
+		     .mmap_process = 25,	.mmap_latency = 50,
+		     .mmap_lead = 25,		.mmap_staging = 100 },
+	[ REC ]	 = { .min_process = 25,		.min_latency = 200,
+		     .dfl_process = 50,		.dfl_latency = 400,
+		     .mmap_process = 25,	.mmap_latency = 50,
+		     .mmap_lead = 25,		.mmap_staging = 1000 },
+};
+
+static size_t page_size;
+static int cmd_fd = -1, notify_fd = -1;
 static pa_context *context;
 static pa_threaded_mainloop *mainloop;
 static pa_mainloop_api *mainloop_api;
@@ -48,8 +76,7 @@ static pa_channel_map channel_map_stor;
 static pa_channel_map *channel_map;
 static pa_stream *stream[2];
 static pa_usec_t stream_ptr_timestamp[2];
-static struct sized_buf rec_sbuf;
-static size_t rec_buf_sz;
+static struct ring_buf rec_buf;
 static int stored_oss_vol[2][2] = { { -1, -1 }, { -1, -1 } };
 static int fail_code;
 
@@ -58,24 +85,43 @@ static pa_sample_spec sample_spec = {
 	.rate = 8000,
 	.channels = 1,
 };
-static int fragshift;		/* number of bytes in a fragment in shifts */
-static int subdivision;		/* alternative way to determine fragsize */
-static int fragsize;		/* calculated fragment size in bytes */
-static int maxfrags;		/* maximum number of fragments */
+static size_t sample_bps = 8000;
+static size_t frame_size = 1;
+
+/* user visible stream parameters */
+static size_t user_frag_size;
+static size_t user_subdivision;	/* alternative way to determine frag_size */
+static size_t user_max_frags;	/* maximum number of fragments */
+static size_t user_max_length;
+
+/* actual stream parameters */
+static size_t frag_size;
+static size_t target_length;
+static size_t max_length;
+static size_t prebuf_size;
+
+/* mmap stuff */
+static size_t mmap_raw_size, mmap_size;
+static int mmap_fd[2] = { -1, -1 };
+static void *mmap_map[2];
+static uint64_t mmap_idx[2];		/* mmap pointer */
+static uint64_t mmap_last_idx[2];	/* last idx for get_ptr */
+static struct ring_buf mmap_stg[2];	/* staging ring buffer */
+static size_t mmap_lead[2];		/* lead bytes */
+static int mmap_sync[2];		/* sync with backend stream */
 
 static const char *dir_str[] = {
-	[PLAY]		= "playback",
-	[REC]		= "recording",
+	[PLAY]		= "PLAY",
+	[REC]		= "REC",
 };
 
 static const char *usage =
-"usage: ossp-padsp -c CMD_FD -r REPLY_FD -n NOTIFY_FD [-d]\n"
+"usage: ossp-padsp -c CMD_FD -n NOTIFY_FD [-d]\n"
 "\n"
 "proxies commands from osspd to pulseaudio\n"
 "\n"
 "options:\n"
 "    -c CMD_FD         fd to receive commands from osspd\n"
-"    -r REPLY_FD       fd to send replies to commands\n"
 "    -n NOTIFY_FD      fd to send async notifications to osspd\n"
 "    -l LOG_LEVEL      set log level\n"
 "    -t                enable log timestamps\n";
@@ -88,6 +134,10 @@ static void stream_rw_callback(pa_stream *s, size_t length, void *userdata);
 #define info_pa(fmt, args...)	info(fmt" (%s)" , ##args, __pa_err)
 #define warn_pa(fmt, args...)	warn(fmt" (%s)" , ##args, __pa_err)
 #define err_pa(fmt, args...)	err(fmt" (%s)" , ##args, __pa_err)
+
+#define round_down(v, t)	((v) / (t) * (t))
+#define round_up(v, t)		(((v) + (t) - 1) / (t) * (t))
+#define is_power2(v)		!((v) & ((v) - 1))
 
 static int do_mixer(int dir, int *vol);
 
@@ -163,6 +213,32 @@ static void stream_op_callback(pa_stream *s, int success, void *userdata)
 		warn_pa("%s() failed", #op);				\
 	_success ? 0 : -EIO; })
 
+static int mmapped(void)
+{
+	return mmap_map[PLAY] || mmap_map[REC];
+}
+
+static uint64_t get_mmap_idx(int dir)
+{
+	uint64_t idx;
+	pa_usec_t time;
+
+	if (!stream[dir])
+		return mmap_idx[dir];
+
+	if (pa_stream_get_time(stream[dir], &time) < 0) {
+		dbg1_pa("pa_stream_get_time() failed");
+		return mmap_idx[dir];
+	}
+
+	/* calculate the current index from time elapsed */
+	idx = ((uint64_t)time * sample_bps / 1000000);
+	/* round down to the nearest frame boundary */
+	idx = idx / frame_size * frame_size;
+
+	return idx;
+}
+
 static void flush_streams(int drain)
 {
 	int i;
@@ -172,19 +248,20 @@ static void flush_streams(int drain)
 
 	dbg0("FLUSH drain=%d", drain);
 
-	if (drain && stream[PLAY])
+	/* mmapped streams run forever, can't drain */
+	if (drain && !mmapped() && stream[PLAY])
 		EXEC_STREAM_OP(pa_stream_drain, stream[PLAY]);
 
 	for (i = 0; i < 2; i++)
 		if (stream[i])
 			EXEC_STREAM_OP(pa_stream_flush, stream[i]);
 
-	rec_buf_sz = 0;
+	ring_consume(&rec_buf, ring_bytes(&rec_buf));
 }
 
 static void kill_streams(void)
 {
-	int i;
+	int dir;
 
 	if (!(stream[PLAY] || stream[REC]))
 		return;
@@ -193,14 +270,41 @@ static void kill_streams(void)
 
 	dbg0("KILL");
 
-	for (i = 0; i < 2; i++) {
-		if (!stream[i])
+	for (dir = 0; dir < 2; dir++) {
+		if (!stream[dir])
 			continue;
-		pa_stream_disconnect(stream[i]);
-		pa_stream_unref(stream[i]);
-		stream[i] = NULL;
-		stream_ptr_timestamp[i] = 0;
+		pa_stream_disconnect(stream[dir]);
+		pa_stream_unref(stream[dir]);
+		stream[dir] = NULL;
+		stream_ptr_timestamp[dir] = 0;
+
+		ring_consume(&mmap_stg[dir], ring_bytes(&mmap_stg[dir]));
+		ring_resize(&mmap_stg[dir], 0);
 	}
+}
+
+static int trigger_streams(int play, int rec)
+{
+	int ret = 0, dir, rc;
+
+	if (play >= 0)
+		stream_corked[PLAY] = !play;
+	if (rec >= 0)
+		stream_corked[REC] = !rec;
+
+	for (dir = 0; dir < 2; dir++) {
+		if (!stream[dir])
+			continue;
+
+		rc = EXEC_STREAM_OP(pa_stream_cork, stream[dir],
+				    stream_corked[dir]);
+		if (!rc && dir == PLAY && !mmap_map[dir] && !stream_corked[dir])
+			rc = EXEC_STREAM_OP(pa_stream_trigger, stream[dir]);
+		if (!ret)
+			ret = rc;
+	}
+
+	return ret;
 }
 
 static void stream_state_callback(pa_stream *s, void *userdata)
@@ -208,25 +312,143 @@ static void stream_state_callback(pa_stream *s, void *userdata)
 	pa_threaded_mainloop_signal(mainloop, 0);
 }
 
+static void stream_underflow_callback(pa_stream *s, void *userdata)
+{
+	int dir = (s == stream[PLAY]) ? PLAY : REC;
+
+	dbg0("%s stream underrun", dir_str[dir]);
+}
+
+static void stream_overflow_callback(pa_stream *s, void *userdata)
+{
+	int dir = (s == stream[PLAY]) ? PLAY : REC;
+
+	dbg0("%s stream overrun", dir_str[dir]);
+}
+
+static size_t duration_to_bytes(size_t dur)
+{
+	return round_up(dur * sample_bps / 1000, frame_size);
+}
+
 static int prepare_streams(void)
 {
-	int dir;
+	const struct stream_params *sp;
+	size_t min_frag_size, min_target_length, tmp;
+	int dir, rc;
+
+	/* nothing to do? */
+	if ((!stream_enabled[PLAY] || stream[PLAY]) &&
+	    (!stream_enabled[REC] || stream[REC]))
+		return 0;
+
+	/* determine sample parameters */
+	sample_bps = pa_bytes_per_second(&sample_spec);
+	frame_size = pa_frame_size(&sample_spec);
+
+	sp = &stream_params[PLAY];
+	if (stream_enabled[REC])
+		sp = &stream_params[REC];
+
+	min_frag_size = duration_to_bytes(sp->min_process);
+	min_target_length = duration_to_bytes(sp->min_latency);
+
+	/* determine frag_size */
+	if (user_frag_size % frame_size) {
+		warn("requested frag_size (%zu) isn't multiple of frame (%zu)",
+		     user_frag_size, frame_size);
+		user_frag_size = round_up(user_frag_size, frame_size);
+	}
+
+	if (user_subdivision)
+		user_frag_size = round_up(sample_bps / user_subdivision,
+					  frame_size);
+
+	if (user_frag_size) {
+		frag_size = user_frag_size;
+		if (frag_size < min_frag_size) {
+			dbg0("requested frag_size (%zu) is smaller than "
+			     "minimum (%zu)", frag_size, min_frag_size);
+			frag_size = min_frag_size;
+		}
+	} else {
+		tmp = round_up(sp->dfl_process * sample_bps / 1000, frame_size);
+		frag_size = tmp;
+		/* if frame_size is power of two, make frag_size so too */
+		if (is_power2(frame_size)) {
+			frag_size = frame_size;
+			while (frag_size < tmp)
+				frag_size <<= 1;
+		}
+		user_frag_size = frag_size;
+	}
+
+	/* determine target and max length */
+	if (user_max_frags) {
+		target_length = user_max_frags * user_frag_size;
+		if (target_length < min_target_length) {
+			dbg0("requested target_length (%zu) is smaller than "
+			     "minimum (%zu)", target_length, min_target_length);
+			target_length = min_target_length;
+		}
+	} else {
+		tmp = round_up(sp->dfl_latency * sample_bps / 1000, frag_size);
+		target_length = tmp;
+		/* if frag_size is power of two, make target_length so
+		 * too and align it to page_size.
+		 */
+		if (is_power2(frag_size)) {
+			target_length = frag_size;
+			while (target_length < max(tmp, page_size))
+				target_length <<= 1;
+		}
+		user_max_frags = target_length / frag_size;
+	}
+
+	user_max_length = user_frag_size * user_max_frags;
+	max_length = target_length + 2 * frag_size;
+
+	/* If mmapped, create backend stream with fixed parameters to
+	 * create illusion of hardware buffer with acceptable latency.
+	 */
+	if (mmapped()) {
+		/* set parameters for backend streams */
+		frag_size = duration_to_bytes(sp->mmap_process);
+		target_length = duration_to_bytes(sp->mmap_latency);
+		max_length = target_length + frag_size;
+		prebuf_size = 0;
+
+		mmap_size = round_down(mmap_raw_size, frame_size);
+		if (mmap_size != mmap_raw_size)
+			warn("mmap_raw_size (%zu) unaligned to frame_size "
+			     "(%zu), mmap_size adjusted to %zu",
+			     mmap_raw_size, frame_size, mmap_size);
+	} else {
+		prebuf_size = min(user_frag_size * 2, user_max_length / 2);
+		prebuf_size = round_down(prebuf_size, frame_size);
+	}
 
 	for (dir = 0; dir < 2; dir++) {
+		pa_buffer_attr new_ba = { };
 		char buf[128];
 		pa_stream *s;
-		size_t bps;
 		pa_stream_flags_t flags;
-		const pa_buffer_attr *ba;
-		pa_buffer_attr new_ba;
 		int vol[2];
+		size_t size;
 
 		if (!stream_enabled[dir] || stream[dir])
 			continue;
 
-		dbg0("CREATE %s %s fsft=%d subd=%d maxf=%d", dir_str[dir],
+		dbg0("CREATE %s %s fsz=%zu:%zu", dir_str[dir],
 		     pa_sample_spec_snprint(buf, sizeof(buf), &sample_spec),
-		     fragshift, subdivision, maxfrags);
+		     frag_size, frag_size * 1000 / sample_bps);
+		dbg0("  tlen=%zu:%zu max=%zu:%zu pre=%zu:%zu",
+		     target_length, target_length * 1000 / sample_bps,
+		     max_length, max_length * 1000 / sample_bps,
+		     prebuf_size, prebuf_size * 1000 / sample_bps);
+		dbg0("  u_sd=%zu u_fsz=%zu:%zu u_maxf=%zu",
+		     user_subdivision, user_frag_size,
+		     user_frag_size * 1000 / sample_bps, user_max_frags);
 
 		channel_map = pa_channel_map_init_auto(&channel_map_stor,
 						       sample_spec.channels,
@@ -241,22 +463,37 @@ static int prepare_streams(void)
 		stream[dir] = s;
 
 		pa_stream_set_state_callback(s, stream_state_callback, NULL);
-		pa_stream_set_write_callback(s, stream_rw_callback, NULL);
-		pa_stream_set_read_callback(s, stream_rw_callback, NULL);
+		if (dir == PLAY) {
+			pa_stream_set_write_callback(s,
+					stream_rw_callback, NULL);
+			pa_stream_set_underflow_callback(s,
+					stream_underflow_callback, NULL);
+		} else {
+			pa_stream_set_read_callback(s,
+					stream_rw_callback, NULL);
+			pa_stream_set_overflow_callback(s,
+					stream_overflow_callback, NULL);
+		}
 
 		flags = PA_STREAM_AUTO_TIMING_UPDATE |
 			PA_STREAM_INTERPOLATE_TIMING;
 		if (stream_corked[dir])
 			flags |= PA_STREAM_START_CORKED;
 
+		new_ba.maxlength = max_length;
+		new_ba.tlength = target_length;
+		new_ba.prebuf = prebuf_size;
+		new_ba.minreq = frag_size;
+		new_ba.fragsize = frag_size;
+
 		if (dir == PLAY) {
-			if (pa_stream_connect_playback(s, NULL, NULL, flags,
+			if (pa_stream_connect_playback(s, NULL, &new_ba, flags,
 						       NULL, NULL)) {
 				err_pa("failed to connect playback stream");
 				goto fail;
 			}
 		} else {
-			if (pa_stream_connect_record(s, NULL, NULL, flags)) {
+			if (pa_stream_connect_record(s, NULL, &new_ba, flags)) {
 				err_pa("failed to connect record stream");
 				goto fail;
 			}
@@ -270,72 +507,31 @@ static int prepare_streams(void)
 			goto fail;
 		}
 
-		/* Calculate and set buffer attributes.  OSS
-		 * applications assume shorter default latency than
-		 * the PA default.  Default to ~250ms used by
-		 * snd_pcm_oss.
-		 */
-		ba = pa_stream_get_buffer_attr(s);
-		if (!ba) {
-			err_pa("failed to get buffer attributes");
-			goto fail;
-		}
-		new_ba = *ba;
-
-		bps = pa_bytes_per_second(&sample_spec);
-
-		if (fragshift) {
-			/* user requested specific size, honor it */
-			fragsize = 1 << fragshift;
-			if (fragsize > ba->maxlength / 2)
-				fragsize = ba->maxlength / 2;
-		} else {
-			int sd = subdivision ?: 4;
-			size_t target = bps / sd;
-
-			/* calculate the first log2 below target */
-			fragsize = ba->maxlength;
-			do {
-				fragsize /= 2;
-			} while (fragsize > target);
-
-			if (fragsize < 16)
-				fragsize = 16;
-		}
-
-		if (maxfrags && fragsize * maxfrags < new_ba.maxlength)
-			new_ba.maxlength = fragsize * maxfrags;
-		maxfrags = new_ba.maxlength / fragsize;
-
-		new_ba.tlength = new_ba.maxlength;
-		new_ba.prebuf = 2 * fragsize;
-		new_ba.minreq = fragsize;
-		new_ba.fragsize = fragsize;
-
-		/* apply calculated buffer attributes */
-		EXEC_STREAM_OP(pa_stream_set_buffer_attr, s, &new_ba);
-
-		ba = pa_stream_get_buffer_attr(s);
-		if (!ba) {
-			err_pa("failed to get buffer attributes");
-			goto fail;
-		}
-
-		dbg0("  max=%u:%zu tlen=%u:%zu pre=%u:%zu",
-		     ba->maxlength, ba->maxlength * 1000 / bps,
-		     ba->tlength, ba->tlength * 1000 / bps,
-		     ba->prebuf, ba->prebuf * 1000 / bps);
-		dbg0("  req=%u:%zu rec=%u:%zu",
-		     ba->minreq, ba->minreq * 1000 / bps,
-		     ba->fragsize, ba->fragsize * 1000 / bps);
-		dbg0("  subd=%d fsz=%d:%zu maxf=%d",
-		     subdivision, fragsize, fragsize * 1000 / bps, maxfrags);
-
 		/* apply stored OSS volume */
 		memcpy(vol, stored_oss_vol[dir], sizeof(vol));
 		if (do_mixer(dir, vol))
 			warn_pa("initial volume control failed");
+
+		/* stream is ready setup mmap stuff */
+		if (!mmap_map[dir])
+			continue;
+
+		/* prep mmap staging buffer */
+		size = round_up(sp->mmap_staging * sample_bps / 1000,
+				frag_size);
+		rc = ring_resize(&mmap_stg[dir], size);
+		if (rc)
+			return rc;
+
+		mmap_idx[dir] = mmap_last_idx[dir] = get_mmap_idx(dir);
+		mmap_lead[dir] = round_up(sp->mmap_lead * sample_bps / 1000,
+					  frame_size);
+		mmap_sync[dir] = 1;
+
+		/* apply the current trigger settings */
+		trigger_streams(-1, -1);
 	}
+
 	return 0;
  fail:
 	return padsp_done();
@@ -377,8 +573,8 @@ static int get_volume(int dir, pa_cvolume *cv)
 
 	if (dir == PLAY) {
 		idx = pa_stream_get_index(stream[PLAY]);
-		 EXEC_OP(pa_context_get_sink_input_info,
-			 context, idx, play_volume_callback, &vr);
+		EXEC_OP(pa_context_get_sink_input_info,
+			context, idx, play_volume_callback, &vr);
 	} else {
 		idx = pa_stream_get_device_index(stream[REC]);
 		EXEC_OP(pa_context_get_source_info_by_index,
@@ -422,6 +618,7 @@ static int chan_left_right(int ch)
 	}
 
 	switch (channel_map->map[ch]) {
+	/*case PA_CHANNEL_POSITION_LEFT:*/	/* same as FRONT_LEFT */
 	case PA_CHANNEL_POSITION_FRONT_LEFT:
 	case PA_CHANNEL_POSITION_REAR_LEFT:
 	case PA_CHANNEL_POSITION_FRONT_LEFT_OF_CENTER:
@@ -429,6 +626,7 @@ static int chan_left_right(int ch)
 	case PA_CHANNEL_POSITION_TOP_FRONT_LEFT:
 	case PA_CHANNEL_POSITION_TOP_REAR_LEFT:
 		return LEFT;
+	/*case PA_CHANNEL_POSITION_RIGHT:*/	/* same as FRONT_RIGHT */
 	case PA_CHANNEL_POSITION_FRONT_RIGHT:
 	case PA_CHANNEL_POSITION_REAR_RIGHT:
 	case PA_CHANNEL_POSITION_FRONT_RIGHT_OF_CENTER:
@@ -444,6 +642,7 @@ static int chan_left_right(int ch)
 static int do_mixer(int dir, int *vol)
 {
 	pa_cvolume cv;
+	unsigned lv, rv;
 	int i, rc;
 
 	if (vol[0] >= 0) {
@@ -473,14 +672,32 @@ static int do_mixer(int dir, int *vol)
 	if (rc)
 		return rc;
 
-	vol[LEFT] = cv.values[0] * 100 / PA_VOLUME_NORM;
-	vol[RIGHT] = cv.values[1] * 100 / PA_VOLUME_NORM;
+	if (cv.channels == 1)
+		lv = rv = pa_cvolume_avg(&cv);
+	else {
+		unsigned lcnt = 0, rcnt = 0;
+
+		for (i = 0, lv = 0, rv = 0; i < cv.channels; i++)
+			switch (chan_left_right(i)) {
+			case LEFT:	lv += cv.values[i];	lcnt++;	break;
+			case RIGHT:	rv += cv.values[i];	rcnt++;	break;
+			}
+
+		if (lcnt)
+			lv /= lcnt;
+		if (rcnt)
+			rv /= rcnt;
+	}
+
+	vol[LEFT] = lv * 100 / PA_VOLUME_NORM;
+	vol[RIGHT] = rv * 100 / PA_VOLUME_NORM;
+
 	return 0;
 }
 
 static ssize_t padsp_mixer(enum ossp_opcode opcode,
 			   void *carg, void *din, size_t din_sz,
-			   void *rarg, void *dout, size_t *dout_szp)
+			   void *rarg, void *dout, size_t *dout_szp, int tfd)
 {
 	struct ossp_mixer_arg *arg = carg;
 	int i, rc[2] = { };
@@ -492,7 +709,7 @@ static ssize_t padsp_mixer(enum ossp_opcode opcode,
 		if (stream[i])
 			rc[i] = do_mixer(i, arg->vol[i]);
 		else
-			memset(arg->vol[i], 0, sizeof(arg->vol[i]));
+			memset(arg->vol[i], -1, sizeof(arg->vol[i]));
 
 	*(struct ossp_mixer_arg *)rarg = *arg;
 	return rc[0] ?: rc[1];
@@ -522,7 +739,7 @@ static void context_subscribe_callback(pa_context *context,
 
 static ssize_t padsp_open(enum ossp_opcode opcode,
 			  void *carg, void *din, size_t din_sz,
-			  void *rarg, void *dout, size_t *dout_szp)
+			  void *rarg, void *dout, size_t *dout_szp, int tfd)
 {
 	struct ossp_dsp_open_arg *arg = carg;
 	char host_name[128] = "(unknown)", opener[128] = "(unknown)";
@@ -584,18 +801,215 @@ static ssize_t padsp_open(enum ossp_opcode opcode,
 	return 0;
 }
 
-static void stream_rw_callback(pa_stream *s, size_t length, void *userdata)
+static void mmap_fill_pstg(void)
 {
-	size_t size;
+	struct ring_buf *stg = &mmap_stg[PLAY];
+	struct ring_buf mmap;
+	uint64_t new_idx = get_mmap_idx(PLAY);
+	size_t bytes, space, size;
+	void *data;
 
-	if (s == stream[PLAY])
-		size = pa_stream_writable_size(s);
-	else
-		size = pa_stream_readable_size(s);
-
-	if (size < fragsize)
+	if (new_idx <= mmap_idx[PLAY])
 		return;
 
+	bytes = new_idx - mmap_idx[PLAY];
+	space = ring_space(stg);
+
+	if (bytes > mmap_size) {
+		dbg0("mmap playback transfer chunk bigger than "
+		     "mmap size (bytes=%zu mmap_size=%zu)", bytes, mmap_size);
+		mmap_sync[PLAY] = 1;
+		bytes = mmap_size;
+	}
+
+	if (bytes > space) {
+		dbg0("mmap playback staging buffer overflow "
+		     "(bytes=%zu space=%zu)", bytes, space);
+		mmap_sync[PLAY] = 1;
+		bytes = space;
+	}
+
+	ring_manual_init(&mmap, mmap_map[PLAY], mmap_size,
+			 new_idx % mmap_size, bytes);
+
+	while ((data = ring_data(&mmap, &size))) {
+		ring_fill(stg, data, size);
+		ring_consume(&mmap, size);
+	}
+
+	mmap_idx[PLAY] = new_idx;
+}
+
+static void mmap_consume_rstg(void)
+{
+	struct ring_buf *stg = &mmap_stg[REC];
+	struct ring_buf mmap;
+	uint64_t new_idx = get_mmap_idx(REC);
+	uint64_t fill_idx = mmap_idx[REC];
+	size_t bytes, space;
+
+	if (new_idx <= mmap_idx[REC])
+		return;
+
+	space = new_idx - mmap_idx[REC];	/* mmapped space to fill in */
+	bytes = ring_bytes(stg);		/* recorded bytes in staging */ 
+
+	if (space > bytes) {
+		if (!mmap_sync[REC])
+			dbg0("mmap recording staging buffer underflow "
+			     "(space=%zu bytes=%zu)", space, bytes);
+		mmap_sync[REC] = 1;
+	}
+
+	if (space > mmap_size) {
+		if (!mmap_sync[REC])
+			dbg0("mmap recording transfer chunk bigger than "
+			     "mmap size (space=%zu mmap_size=%zu)",
+			     bytes, mmap_size);
+		mmap_sync[REC] = 1;
+		space = mmap_size;
+	}
+
+	/* If resync is requested, leave lead bytes in the staging
+	 * buffer and copy everything else such that data is filled
+	 * upto the new_idx.  If there are more bytes in staging than
+	 * available space, those will be dropped.
+	 */
+	if (mmap_sync[REC]) {
+		ssize_t avail = bytes - mmap_lead[REC];
+
+		/* make sure we always have lead bytes in staging */
+		if (avail < 0)
+			goto skip;
+
+		if (avail > space) {
+			dbg0("dropping %zu bytes from record staging buffer",
+			     avail - space);
+			ring_consume(&mmap_stg[REC], avail - space);
+			avail = space;
+		} else {
+			dbg0("skippping %zu bytes in record mmap map",
+			     space - avail);
+			space = avail;
+		}
+
+		assert(new_idx >= avail);
+		fill_idx = new_idx - avail;
+		mmap_sync[REC] = 0;
+	}
+
+	ring_manual_init(&mmap, mmap_map[REC], mmap_size,
+			 fill_idx % mmap_size, 0);
+
+	while (space) {
+		void *data;
+		size_t size, todo;
+
+		data = ring_data(stg, &size);
+		assert(data);
+
+		todo = min(size, space);
+		ring_fill(&mmap, data, todo);
+
+		ring_consume(stg, todo);
+		space -= todo;
+	}
+
+ skip:
+	mmap_idx[REC] = new_idx;
+}
+
+static void do_mmap_write(size_t space)
+{
+	struct ring_buf *stg = &mmap_stg[PLAY];
+	size_t todo;
+	void *data;
+
+	space = round_down(space, frame_size);
+	mmap_fill_pstg();
+
+	while (space && (data = ring_data(stg, &todo))) {
+		pa_seek_mode_t mode = PA_SEEK_RELATIVE_END;
+		int64_t offset = 0;
+
+		todo = min(todo, space);
+
+		if (mmap_sync[PLAY]) {
+			mode = PA_SEEK_RELATIVE_ON_READ;
+			offset = (int64_t)mmap_lead[PLAY] - ring_bytes(stg);
+			dbg0("mmap resync, offset=%ld", (long)offset);
+		}
+
+		if (pa_stream_write(stream[PLAY], data, todo, NULL,
+				    offset, mode) < 0) {
+			err_pa("pa_stream_write() failed");
+			padsp_done();
+			return;
+		}
+
+		mmap_sync[PLAY] = 0;
+		ring_consume(stg, todo);
+		space -= todo;
+	}
+}
+
+static void do_mmap_read(size_t bytes)
+{
+	struct ring_buf *stg = &mmap_stg[REC];
+
+	bytes = round_down(bytes, frame_size);
+	mmap_consume_rstg();
+
+	while (bytes) {
+		const void *peek_data;
+		size_t size;
+
+		if (pa_stream_peek(stream[REC], &peek_data, &size)) {
+			err_pa("pa_stream_peek() failed");
+			padsp_done();
+			return;
+		}
+
+		if (!peek_data)
+			break;
+
+		if (size <= ring_space(stg))
+			ring_fill(stg, peek_data, size);
+		else {
+			if (!mmap_sync[REC])
+				dbg0("recording staging buffer overflow, "
+				     "requesting resync");
+			mmap_sync[REC] = 1;
+		}
+
+		pa_stream_drop(stream[REC]);
+		bytes -= size;
+	}
+}
+
+static void stream_rw_callback(pa_stream *s, size_t length, void *userdata)
+{
+	int dir;
+	size_t size;
+
+	if (s == stream[PLAY]) {
+		dir = PLAY;
+		size = pa_stream_writable_size(s);
+		if (mmap_map[PLAY])
+			do_mmap_write(size);
+	} else if (s == stream[REC]) {
+		dir = REC;
+		size = pa_stream_readable_size(s);
+		if (mmap_map[REC])
+			do_mmap_read(size);
+	} else {
+		dbg0("stream_rw_callback(): unknown stream %p PLAY/REC=%p/%p\n",
+		     s, stream[PLAY], stream[REC]);
+		return;
+	}
+
+	if (size < user_frag_size)
+		return;
 	if (stream_waiting)
 		pa_threaded_mainloop_signal(mainloop, 0);
 	if (stream_notify) {
@@ -621,7 +1035,7 @@ static void stream_rw_callback(pa_stream *s, size_t length, void *userdata)
 
 static ssize_t padsp_write(enum ossp_opcode opcode,
 			   void *carg, void *din, size_t din_sz,
-			   void *rarg, void *dout, size_t *dout_szp)
+			   void *rarg, void *dout, size_t *dout_szp, int tfd)
 {
 	struct ossp_dsp_rw_arg *arg = carg;
 	size_t size;
@@ -632,13 +1046,14 @@ static ssize_t padsp_write(enum ossp_opcode opcode,
 	stream_waiting++;
 	while (1) {
 		size = pa_stream_writable_size(stream[PLAY]);
-		if (arg->nonblock || size >= fragsize)
+		if (arg->nonblock || size >= user_frag_size)
 			break;
 		pa_threaded_mainloop_wait(mainloop);
 	}
 	stream_waiting--;
 
-	if (size < fragsize)
+	size = round_down(size, user_frag_size);
+	if (!size)
 		return -EAGAIN;
 
 	size = min(size, din_sz);
@@ -654,26 +1069,27 @@ static ssize_t padsp_write(enum ossp_opcode opcode,
 
 static ssize_t padsp_read(enum ossp_opcode opcode,
 			  void *carg, void *din, size_t din_sz,
-			  void *rarg, void *dout, size_t *dout_szp)
+			  void *rarg, void *dout, size_t *dout_szp, int tfd)
 {
 	struct ossp_dsp_rw_arg *arg = carg;
 	size_t size;
+	void *data;
 
 	if (prepare_streams() || !stream[REC])
 		return -EIO;
  again:
-	stream_waiting++;
-	while (1) {
-		size = pa_stream_readable_size(stream[REC]) + rec_buf_sz;
-		if (arg->nonblock || size >= fragsize)
-			break;
-		pa_threaded_mainloop_wait(mainloop);
+	if (!arg->nonblock) {
+		stream_waiting++;
+		while (1) {
+			size = pa_stream_readable_size(stream[REC]);
+			if (size + ring_bytes(&rec_buf) >= user_frag_size)
+				break;
+			pa_threaded_mainloop_wait(mainloop);
+		}
+		stream_waiting--;
 	}
-	stream_waiting--;
-	if (size < fragsize)
-		return -EAGAIN;
 
-	if (rec_buf_sz < max_t(size_t, fragsize, *dout_szp)) {
+	while (ring_bytes(&rec_buf) < max(user_frag_size, *dout_szp)) {
 		const void *peek_data;
 
 		if (pa_stream_peek(stream[REC], &peek_data, &size) < 0) {
@@ -681,42 +1097,54 @@ static ssize_t padsp_read(enum ossp_opcode opcode,
 			return padsp_done();
 		}
 
-		if (ensure_sbuf_size(&rec_sbuf, rec_buf_sz + size)) {
-			err_pa("failed to allocate recording buffer");
-			return padsp_done();
+		if (!peek_data)
+			break;
+
+		if (ring_space(&rec_buf) < size) {
+			size_t bufsz;
+
+			bufsz = ring_size(&rec_buf);
+			bufsz = max(2 * bufsz, bufsz + 2 * size);
+
+			if (ring_resize(&rec_buf, bufsz)) {
+				err("failed to allocate recording buffer");
+				return padsp_done();
+			}
 		}
 
-		memcpy(rec_sbuf.buf + rec_buf_sz, peek_data, size);
-		rec_buf_sz += size;
-
+		ring_fill(&rec_buf, peek_data, size);
 		pa_stream_drop(stream[REC]);
 	}
 
-	/*
-	 * Readable size report isn't always reliable and the
-	 * following condition somtimes triggers.
-	 */
-	if (rec_buf_sz < fragsize) {
+	size = round_down(ring_bytes(&rec_buf), user_frag_size);
+	if (!size) {
 		if (arg->nonblock)
 			return -EAGAIN;
 		else
 			goto again;
 	}
 
-	size = rec_buf_sz / fragsize * fragsize;
-	size = min(size, *dout_szp);
+	*dout_szp = size = min(size, *dout_szp);
 
-	memcpy(dout, rec_sbuf.buf, size);
-	memmove(rec_sbuf.buf, rec_sbuf.buf + size, rec_buf_sz - size);
-	rec_buf_sz -= size;
+	while (size) {
+		size_t cnt;
 
-	*dout_szp = size;
-	return size;
+		data = ring_data(&rec_buf, &cnt);
+		assert(data);
+
+		cnt = min(size, cnt);
+		memcpy(dout, data, cnt);
+		ring_consume(&rec_buf, cnt);
+		dout += cnt;
+		size -= cnt;
+	}
+
+	return *dout_szp;
 }
 
 static ssize_t padsp_poll(enum ossp_opcode opcode,
 			  void *carg, void *din, size_t din_sz,
-			  void *rarg, void *dout, size_t *dout_szp)
+			  void *rarg, void *dout, size_t *dout_szp, int tfd)
 {
 	unsigned revents = 0;
 
@@ -734,9 +1162,93 @@ static ssize_t padsp_poll(enum ossp_opcode opcode,
 	return 0;
 }
 
+static ssize_t padsp_mmap(enum ossp_opcode opcode,
+			  void *carg, void *din, size_t din_sz,
+			  void *rarg, void *dout, size_t *dout_szp, int tfd)
+{
+	struct ossp_dsp_mmap_arg *arg = carg;
+	int dir = arg->dir;
+	void *map;
+	int rc;
+
+	assert(!mmap_map[dir] && mmap_fd[dir] < 0);
+
+	kill_streams();
+
+	/* arg->size is rounded up to the nearest page boundary.
+	 * There is no way to tell what the actual requested value is
+	 * but assume that it was the reported buffer space if it
+	 * falls into the same page aligned range.
+	 */
+	mmap_raw_size = arg->size;
+	if (user_max_length && user_max_length < mmap_raw_size &&
+	    round_up(mmap_raw_size, page_size) ==
+	    round_up(user_max_length, page_size)) {
+		info("MMAP adjusting raw_size %zu -> %zu",
+		     mmap_raw_size, user_max_length);
+		mmap_raw_size = user_max_length;
+	}
+
+	if (ftruncate(tfd, mmap_raw_size)) {
+		rc = -errno;
+		warn_e(rc, "failed to resize mmap file to %zu bytes",
+		       mmap_raw_size);
+		return rc;
+	}
+
+	map = mmap(NULL, mmap_raw_size, PROT_READ | PROT_WRITE, MAP_SHARED,
+		   tfd, 0);
+	if (map == MAP_FAILED) {
+		rc = -errno;
+		warn_e(rc, "failed to mmap the mmap file, fd=%d sz=%zu",
+		       tfd, mmap_raw_size);
+		return rc;
+	}
+	dbg0("MMAP fd=%d map=%p sz=%zu", tfd, map, mmap_raw_size);
+
+	mmap_fd[dir] = tfd;
+	mmap_map[dir] = map;
+
+	/* if mmapped, only mmapped streams are enabled */
+	stream_enabled[PLAY] = !!mmap_map[PLAY];
+	stream_enabled[REC] = !!mmap_map[REC];
+
+	return 0;
+}
+
+static ssize_t padsp_munmap(enum ossp_opcode opcode,
+			    void *carg, void *din, size_t din_sz,
+			    void *rarg, void *dout, size_t *dout_szp, int tfd)
+{
+	int dir = *(int *)carg;
+	int fd = mmap_fd[dir];
+	void *map = mmap_map[dir];
+	int rc = 0;
+
+	assert(map && fd >= 0);
+
+	kill_streams();
+
+	mmap_fd[dir] = -1;
+	mmap_map[dir] = NULL;
+
+	if (munmap(map, mmap_raw_size)) {
+		rc = -errno;
+		warn_e(rc, "munmap for %s failed, map=%p size=%zu",
+		       dir_str[dir], map, mmap_raw_size);
+	}
+
+	if (close(fd)) {
+		rc = -errno;
+		warn_e(rc, "close for %s failed, fd=%d", dir_str[dir], fd);
+	}
+
+	return rc;
+}
+
 static ssize_t padsp_flush(enum ossp_opcode opcode,
 			   void *carg, void *din, size_t din_sz,
-			   void *rarg, void *dout, size_t *dout_szp)
+			   void *rarg, void *dout, size_t *dout_szp, int tfd)
 {
 	flush_streams(opcode == OSSP_DSP_SYNC);
 	return 0;
@@ -744,16 +1256,15 @@ static ssize_t padsp_flush(enum ossp_opcode opcode,
 
 static ssize_t padsp_post(enum ossp_opcode opcode,
 			  void *carg, void *din, size_t din_sz,
-			  void *rarg, void *dout, size_t *dout_szp)
+			  void *rarg, void *dout, size_t *dout_szp, int tfd)
 {
-	if (stream[PLAY])
-		return EXEC_STREAM_OP(pa_stream_trigger, stream[PLAY]);
-	return 0;
+	return trigger_streams(1, -1);
 }
 
 static ssize_t padsp_get_param(enum ossp_opcode opcode,
 			       void *carg, void *din, size_t din_sz,
-			       void *rarg, void *dout, size_t *dout_szp)
+			       void *rarg, void *dout, size_t *dout_szp,
+			       int tfd)
 {
 	int v = 0;
 
@@ -773,7 +1284,7 @@ static ssize_t padsp_get_param(enum ossp_opcode opcode,
 	case OSSP_DSP_GET_BLKSIZE:
 		if (prepare_streams() < 0)
 			return -EIO;
-		v = fragsize;
+		v = user_frag_size;
 		break;
 
 	case OSSP_DSP_GET_FORMATS:
@@ -799,7 +1310,8 @@ static ssize_t padsp_get_param(enum ossp_opcode opcode,
 
 static ssize_t padsp_set_param(enum ossp_opcode opcode,
 			       void *carg, void *din, size_t din_sz,
-			       void *rarg, void *dout, size_t *dout_szp)
+			       void *rarg, void *dout, size_t *dout_szp,
+			       int tfd)
 {
 	pa_sample_spec new_spec = sample_spec;
 	int v = *(int *)carg;
@@ -814,39 +1326,38 @@ static ssize_t padsp_set_param(enum ossp_opcode opcode,
 			sample_spec = new_spec;
 		v = sample_spec.rate;
 		break;
+
 	case OSSP_DSP_SET_CHANNELS:
 		new_spec.channels = v;
 		if (pa_sample_spec_valid(&new_spec))
 			sample_spec = new_spec;
 		v = sample_spec.channels;
 		break;
+
 	case OSSP_DSP_SET_FORMAT:
 		new_spec.format = fmt_oss_to_pa(v);
 		if (pa_sample_spec_valid(&new_spec))
 			sample_spec = new_spec;
 		v = fmt_pa_to_oss(sample_spec.format);
 		break;
+
 	case OSSP_DSP_SET_SUBDIVISION:
 		if (!v) {
-			v = subdivision ?: 1;
+			v = user_subdivision ?: 1;
 			break;
 		}
-		if (subdivision || fragshift)
-			return -EINVAL;
-		if (subdivision != 1 && subdivision != 2 && subdivision != 4 &&
-		    subdivision != 8 && subdivision != 16)
-			return -EINVAL;
-		subdivision = v;
+		user_frag_size= 0;
+		user_subdivision = v;
 		break;
+
 	case OSSP_DSP_SET_FRAGMENT:
-		if (subdivision || fragshift)
-			return -EINVAL;
-		fragshift = v & 0xffff;
-		maxfrags = (v >> 16) & 0xffff;
-		if (fragshift < 4)
-			fragshift = 4;
-		if (maxfrags < 2)
-			maxfrags = 2;
+		user_subdivision = 0;
+		user_frag_size = 1 << (v & 0xffff);
+		user_max_frags = (v >> 16) & 0xffff;
+		if (user_frag_size < 4)
+			user_frag_size = 4;
+		if (user_max_frags < 2)
+			user_max_frags = 2;
 		break;
 	default:
 		assert(0);
@@ -859,48 +1370,48 @@ static ssize_t padsp_set_param(enum ossp_opcode opcode,
 
 static ssize_t padsp_set_trigger(enum ossp_opcode opcode,
 				 void *carg, void *din, size_t din_sz,
-				 void *rarg, void *dout, size_t *dout_szp)
+				 void *rarg, void *dout, size_t *dout_szp,
+				 int fd)
 {
 	int enable = *(int *)carg;
-	int i;
 
-	stream_corked[PLAY] = (enable & PCM_ENABLE_OUTPUT) ? 0 : 1;
-	stream_corked[REC] = (enable & PCM_ENABLE_INPUT) ? 0 : 1;
-
-	for (i = 0; i < 2; i++) {
-		if (!stream[i])
-			continue;
-
-		if (i == PLAY && !stream_corked[i])
-			EXEC_STREAM_OP(pa_stream_trigger, stream[i]);
-		else
-			EXEC_STREAM_OP(pa_stream_cork, stream[i],
-				       stream_corked[i]);
-	}
-
-	return 0;
+	return trigger_streams(enable & PCM_ENABLE_OUTPUT,
+			       enable & PCM_ENABLE_INPUT);
 }
 
 static ssize_t padsp_get_space(enum ossp_opcode opcode,
 			       void *carg, void *din, size_t din_sz,
-			       void *rarg, void *dout, size_t *dout_szp)
+			       void *rarg, void *dout, size_t *dout_szp, int tfd)
 {
 	int dir = (opcode == OSSP_DSP_GET_OSPACE) ? PLAY : REC;
-	size_t space;
 	struct audio_buf_info info = { };
+	int rc;
 
-	if (prepare_streams() < 0 || !stream[dir])
+	rc = prepare_streams();
+	if (rc)
 		return -EIO;
 
-	if (dir == PLAY)
-		space = pa_stream_writable_size(stream[PLAY]);
-	else
-		space = pa_stream_readable_size(stream[REC]);
+	if (mmapped()) {
+		info.fragments = mmap_raw_size / user_frag_size;
+		info.fragstotal = info.fragments;
+		info.fragsize = user_frag_size;
+		info.bytes = mmap_raw_size;
+	} else {
+		size_t space;
 
-	info.fragments = space / fragsize;
-	info.fragstotal = maxfrags;
-	info.fragsize = fragsize;
-	info.bytes = space;
+		if (dir == PLAY)
+			space = pa_stream_writable_size(stream[PLAY]);
+		else
+			space = pa_stream_readable_size(stream[REC]);
+
+		space = round_down(space, user_frag_size);
+		space = min(space, user_frag_size * user_max_frags);
+
+		info.fragments = space / user_frag_size;
+		info.fragstotal = user_max_frags;
+		info.fragsize = user_frag_size;
+		info.bytes = space;
+	}
 
 	*(struct audio_buf_info *)rarg = info;
 	return 0;
@@ -908,32 +1419,46 @@ static ssize_t padsp_get_space(enum ossp_opcode opcode,
 
 static ssize_t padsp_get_ptr(enum ossp_opcode opcode,
 			     void *carg, void *din, size_t din_sz,
-			     void *rarg, void *dout, size_t *dout_szp)
+			     void *rarg, void *dout, size_t *dout_szp, int tfd)
 {
 	int dir = (opcode == OSSP_DSP_GET_OPTR) ? PLAY : REC;
-	size_t buf_size = maxfrags * fragsize;
-	size_t frame_size = pa_frame_size(&sample_spec);
-	double bpus = (double)pa_bytes_per_second(&sample_spec) / 1000000;
-	size_t bytes, delta_bytes;
-	pa_usec_t usec, delta;
 	struct count_info info = { };
 
 	if (prepare_streams() < 0 || !stream[dir])
 		return -EIO;
 
-	if (pa_stream_get_time(stream[dir], &usec) < 0) {
-		warn_pa("pa_stream_get_time() failed");
-		return -EIO;
+	if (mmap_map[dir]) {
+		/* mmap operation in progress, report mmap buffer parameters */
+		if (dir == PLAY)
+			mmap_fill_pstg();
+		else
+			mmap_consume_rstg();
+
+		info.bytes = mmap_idx[dir];
+		info.blocks = (mmap_idx[dir] - mmap_last_idx[dir]) / frame_size;
+		info.ptr = mmap_idx[dir] % mmap_size;
+
+		mmap_last_idx[dir] = mmap_idx[dir];
+	} else {
+		/* simulate pointers using timestamps */
+		double bpus = (double)sample_bps / 1000000;
+		size_t bytes, delta_bytes;
+		pa_usec_t usec, delta;
+
+		if (pa_stream_get_time(stream[dir], &usec) < 0) {
+			warn_pa("pa_stream_get_time() failed");
+			return -EIO;
+		}
+
+		delta = usec - stream_ptr_timestamp[dir];
+		stream_ptr_timestamp[dir] = usec;
+		bytes = bpus * usec;
+		delta_bytes = bpus * delta;
+
+		info.bytes = bytes & INT_MAX;
+		info.blocks = (delta_bytes + frame_size - 1) / frame_size;
+		info.ptr = bytes % user_max_length;
 	}
-
-	delta = usec - stream_ptr_timestamp[dir];
-	stream_ptr_timestamp[dir] = usec;
-	bytes = bpus * usec;
-	delta_bytes = bpus * delta;
-
-	info.bytes = bytes & INT_MAX;
-	info.blocks = (delta_bytes + frame_size - 1) / frame_size;
-	info.ptr = bytes % buf_size;
 
 	*(struct count_info *)rarg = info;
 	return 0;
@@ -941,9 +1466,10 @@ static ssize_t padsp_get_ptr(enum ossp_opcode opcode,
 
 static ssize_t padsp_get_odelay(enum ossp_opcode opcode,
 				void *carg, void *din, size_t din_sz,
-				void *rarg, void *dout, size_t *dout_szp)
+				void *rarg, void *dout, size_t *dout_szp,
+				int fd)
 {
-	double bpus = (double)pa_bytes_per_second(&sample_spec) / 1000000;
+	double bpus = (double)sample_bps / 1000000;
 	pa_usec_t usec;
 
 	if (prepare_streams() < 0 || !stream[PLAY])
@@ -964,6 +1490,8 @@ static ossp_action_fn_t action_fn_tbl[OSSP_NR_OPCODES] = {
 	[OSSP_DSP_READ]		= padsp_read,
 	[OSSP_DSP_WRITE]	= padsp_write,
 	[OSSP_DSP_POLL]		= padsp_poll,
+	[OSSP_DSP_MMAP]		= padsp_mmap,
+	[OSSP_DSP_MUNMAP]	= padsp_munmap,
 	[OSSP_DSP_RESET]	= padsp_flush,
 	[OSSP_DSP_SYNC]		= padsp_flush,
 	[OSSP_DSP_POST]		= padsp_post,
@@ -1008,6 +1536,8 @@ int main(int argc, char **argv)
 	struct sigaction sa;
 	int opt, rc;
 
+	page_size = sysconf(_SC_PAGE_SIZE);
+
 	snprintf(username, sizeof(username), "uid%d", getuid());
 	if (getpwuid_r(getuid(), &pw_buf, pw_sbuf, sizeof(pw_sbuf), &pw) == 0)
 		snprintf(username, sizeof(username), "%s", pw->pw_name);
@@ -1019,9 +1549,6 @@ int main(int argc, char **argv)
 		switch (opt) {
 		case 'c':
 			cmd_fd = atoi(optarg);
-			break;
-		case 'r':
-			reply_fd = atoi(optarg);
 			break;
 		case 'n':
 			notify_fd = atoi(optarg);
@@ -1035,7 +1562,7 @@ int main(int argc, char **argv)
 		}
 	}
 
-	if (cmd_fd < 0 || reply_fd < 0 || notify_fd < 0) {
+	if (cmd_fd < 0 || notify_fd < 0) {
 		fprintf(stderr, usage);
 		return 1;
 	}
@@ -1062,7 +1589,7 @@ int main(int argc, char **argv)
 	/* Okay, now we're open for business */
 	rc = 0;
 	do {
-		rc = ossp_slave_process_command(cmd_fd, reply_fd, action_fn_tbl,
+		rc = ossp_slave_process_command(cmd_fd, action_fn_tbl,
 						action_pre, action_post);
 	} while (rc > 0 && !fail_code);
 	if (rc)

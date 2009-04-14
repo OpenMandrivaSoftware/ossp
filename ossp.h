@@ -1,8 +1,8 @@
 /*
  * ossp - OSS Proxy: emulate OSS device using CUSE
  *
- * Copyright (C) 2008       SUSE Linux Products GmbH
- * Copyright (C) 2008       Tejun Heo <teheo@suse.de>
+ * Copyright (C) 2008-2009  SUSE Linux Products GmbH
+ * Copyright (C) 2008-2009  Tejun Heo <tj@kernel.org>
  *
  * This file is released under the GPLv2.
  */
@@ -14,7 +14,7 @@
 #include <inttypes.h>
 #include <sys/soundcard.h>
 
-#define OSSP_VERSION		"1.0"
+#define OSSP_VERSION		"1.2"
 #define OSSP_CMD_MAGIC		0xdeadbeef
 #define OSSP_REPLY_MAGIC	0xbeefdead
 #define OSSP_NOTIFY_MAGIC	0xbebebebe
@@ -31,6 +31,8 @@ enum ossp_opcode {
 	OSSP_DSP_READ,
 	OSSP_DSP_WRITE,
 	OSSP_DSP_POLL,
+	OSSP_DSP_MMAP,
+	OSSP_DSP_MUNMAP,
 
 	OSSP_DSP_RESET,
 	OSSP_DSP_SYNC,
@@ -79,6 +81,11 @@ struct ossp_dsp_rw_arg {
 	unsigned		nonblock:1;
 };
 
+struct ossp_dsp_mmap_arg {
+	int			dir;
+	size_t			size;
+};
+
 struct ossp_cmd {
 	unsigned		magic;
 	enum ossp_opcode	opcode;
@@ -100,6 +107,7 @@ struct ossp_notify {
 struct ossp_arg_size {
 	ssize_t			carg_size;
 	ssize_t			rarg_size;
+	unsigned		has_fd:1;
 };
 
 extern const struct ossp_arg_size ossp_arg_sizes[OSSP_NR_OPCODES];
