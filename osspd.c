@@ -79,9 +79,7 @@ struct ossp_mixer {
 
 struct ossp_mixer_cmd {
 	struct ossp_mixer	*mixer;
-	struct ossp_mixer_arg	get;
 	struct ossp_mixer_arg	set;
-	int			nr_gets[2][2];
 	int			out_dir;
 	int			rvol;
 };
@@ -113,6 +111,11 @@ struct ossp_stream {
 
 	/* the following dead flag is set asynchronously, keep it separate. */
 	int			dead;
+
+	/* stream mixer state, protected by mixer_mutex */
+	int			mixer_pending;
+	int			vol[2][2];
+	int			vol_set[2][2];
 
 	struct ossp_uid_cnt	*ucnt;
 	struct fuse_session	*se;	/* associated fuse session */
@@ -238,7 +241,7 @@ static struct ossp_stream *find_os_by_notify_rx(int notify_rx)
  * Command and ioctl helpers
  */
 
-static ssize_t exec_cmd(struct ossp_stream *os, enum ossp_opcode opcode,
+static ssize_t exec_cmd_intern(struct ossp_stream *os, enum ossp_opcode opcode,
 	const void *carg, size_t carg_size, const void *din, size_t din_size,
 	void *rarg, size_t rarg_size, void *dout, size_t *dout_sizep, int fd)
 {
@@ -259,8 +262,6 @@ static ssize_t exec_cmd(struct ossp_stream *os, enum ossp_opcode opcode,
 	dbg1_os(os, "%s carg=%zu din=%zu rarg=%zu dout=%zu",
 		ossp_cmd_str[opcode], carg_size, din_size, rarg_size,
 		dout_size);
-
-	pthread_mutex_lock(&os->cmd_mutex);
 
 	if (fd >= 0) {
 		struct cmsghdr *cmsg;
@@ -326,16 +327,83 @@ static ssize_t exec_cmd(struct ossp_stream *os, enum ossp_opcode opcode,
 	}
 
 out_unlock:
-	pthread_mutex_unlock(&os->cmd_mutex);
 	dbg1_os(os, "  completed, result=%d dout=%zu",
 		reply.result, dout_size);
 	return reply.result;
 
 fail:
-	pthread_mutex_unlock(&os->cmd_mutex);
 	warn_os(os, "communication with slave failed (%s)", reason);
 	os->dead = 1;
 	return rc;
+}
+
+static ssize_t exec_cmd(struct ossp_stream *os, enum ossp_opcode opcode,
+	const void *carg, size_t carg_size, const void *din, size_t din_size,
+	void *rarg, size_t rarg_size, void *dout, size_t *dout_sizep, int fd)
+{
+	int is_mixer;
+	int i, j;
+	ssize_t ret, mret;
+
+	/* mixer command is handled exlicitly below */
+	is_mixer = opcode == OSSP_MIXER;
+	if (is_mixer) {
+		ret = -pthread_mutex_trylock(&os->cmd_mutex);
+		if (ret)
+			return ret;
+	} else {
+		pthread_mutex_lock(&os->cmd_mutex);
+
+		ret = exec_cmd_intern(os, opcode, carg, carg_size,
+				      din, din_size, rarg, rarg_size,
+				      dout, dout_sizep, fd);
+	}
+
+	/* lazy mixer handling */
+	pthread_mutex_lock(&mixer_mutex);
+
+	if (os->mixer_pending) {
+		struct ossp_mixer_arg marg;
+	repeat_mixer:
+		/* we have mixer command pending */
+		memcpy(marg.vol, os->vol_set, sizeof(os->vol_set));
+		memset(os->vol_set, -1, sizeof(os->vol_set));
+
+		pthread_mutex_unlock(&mixer_mutex);
+		mret = exec_cmd_intern(os, OSSP_MIXER, &marg, sizeof(marg),
+				       NULL, 0, &marg, sizeof(marg), NULL, NULL,
+				       -1);
+		pthread_mutex_lock(&mixer_mutex);
+
+		/* was there mixer set request while executing mixer command? */
+		for_each_vol(i, j)
+			if (os->vol_set[i][j] >= 0)
+				goto repeat_mixer;
+
+		/* update internal mixer state */
+		if (mret == 0) {
+			for_each_vol(i, j) {
+				if (marg.vol[i][j] >= 0) {
+					if (os->vol[i][j] != marg.vol[i][j])
+						os->mixer->modify_counter++;
+					os->vol[i][j] = marg.vol[i][j];
+				}
+			}
+		}
+		os->mixer_pending = 0;
+	}
+
+	pthread_mutex_unlock(&os->cmd_mutex);
+
+	/*
+	 * mixer mutex must be released after cmd_mutex so that
+	 * exec_mixer_cmd() can guarantee that mixer_pending flags
+	 * will be handled immediately or when the currently
+	 * in-progress command completes.
+	 */
+	pthread_mutex_unlock(&mixer_mutex);
+
+	return is_mixer ? mret : ret;
 }
 
 static ssize_t exec_simple_cmd(struct ossp_stream *os,
@@ -537,42 +605,65 @@ static void init_mixer_cmd(struct ossp_mixer_cmd *mxcmd,
 
 static int exec_mixer_cmd(struct ossp_mixer_cmd *mxcmd, struct ossp_stream *os)
 {
-	struct ossp_mixer_arg arg = mxcmd->set;
 	int i, j, rc;
 
-	rc = exec_simple_cmd(os, OSSP_MIXER, &arg, &arg);
+	/*
+	 * Set pending flags before trying to execute mixer command.
+	 * Combined with lock release order in exec_cmd(), this
+	 * guarantees that the mixer command will be executed
+	 * immediately or when the current command completes.
+	 */
+	pthread_mutex_lock(&mixer_mutex);
+	os->mixer_pending = 1;
+	for_each_vol(i, j)
+		if (mxcmd->set.vol[i][j] >= 0)
+			os->vol_set[i][j] = mxcmd->set.vol[i][j];
+	pthread_mutex_unlock(&mixer_mutex);
+
+	rc = exec_simple_cmd(os, OSSP_MIXER, NULL, NULL);
 	if (rc >= 0) {
-		for_each_vol(i, j)
-			if (arg.vol[i][j] >= 0) {
-				mxcmd->get.vol[i][j] += arg.vol[i][j];
-				mxcmd->nr_gets[i][j]++;
-			}
 		dbg0_os(os, "volume set=%d/%d:%d/%d get=%d/%d:%d/%d",
 			mxcmd->set.vol[PLAY][LEFT], mxcmd->set.vol[PLAY][RIGHT],
 			mxcmd->set.vol[REC][LEFT], mxcmd->set.vol[REC][RIGHT],
-			mxcmd->get.vol[PLAY][LEFT], mxcmd->get.vol[PLAY][RIGHT],
-			mxcmd->get.vol[REC][LEFT], mxcmd->get.vol[REC][RIGHT]);
-	} else
+			os->vol[PLAY][LEFT], os->vol[PLAY][RIGHT],
+			os->vol[REC][LEFT], os->vol[REC][RIGHT]);
+	} else if (rc != -EBUSY)
 		warn_ose(os, rc, "mixer command failed");
+
 	return rc;
 }
 
 static void finish_mixer_cmd(struct ossp_mixer_cmd *mxcmd)
 {
 	struct ossp_mixer *mixer = mxcmd->mixer;
+	struct ossp_stream *os;
 	int dir = mxcmd->out_dir;
-	int vol[2][2] = { { -1, -1 }, { -1, -1 } };
-	int i, j, vol_changed = 0;
+	int vol[2][2] = { };
+	int cnt[2][2] = { };
+	int i, j;
 
 	pthread_mutex_lock(&mixer_mutex);
 
-	for_each_vol(i, j) {
-		if (mxcmd->set.vol[i][j] >= 0) {
-			vol[i][j] = mxcmd->set.vol[i][j];
-			vol_changed = 1;
+	/* get volume of all streams attached to this mixer */
+	pthread_mutex_lock(&mutex);
+	list_for_each_entry(os, os_pgrp_tbl_head(mixer->pgrp), pgrp_link) {
+		if (os->pgrp != mixer->pgrp)
+			continue;
+		for_each_vol(i, j) {
+			if (os->vol[i][j] < 0)
+				continue;
+			vol[i][j] += os->vol[i][j];
+			cnt[i][j]++;
 		}
-		if (mxcmd->nr_gets[i][j])
-			vol[i][j] = mxcmd->get.vol[i][j] / mxcmd->nr_gets[i][j];
+	}
+	pthread_mutex_unlock(&mutex);
+
+	/* calculate the summary volume values */
+	for_each_vol(i, j) {
+		if (mxcmd->set.vol[i][j] >= 0)
+			vol[i][j] = mxcmd->set.vol[i][j];
+		else if (cnt[i][j])
+			vol[i][j] = vol[i][j] / cnt[i][j];
 		else if (mixer->vol[i][j] >= 0)
 			vol[i][j] = mixer->vol[i][j];
 		else
@@ -580,8 +671,6 @@ static void finish_mixer_cmd(struct ossp_mixer_cmd *mxcmd)
 
 		vol[i][j] = min(max(0, vol[i][j]), 100);
 	}
-
-	mixer->modify_counter += vol_changed;
 
 	if (dir >= 0)
 		mxcmd->rvol = vol[dir][LEFT] | (vol[dir][RIGHT] << 8);
@@ -853,6 +942,9 @@ static int alloc_os(size_t stream_size, pid_t pid, uid_t pgrp,
 	os->uid = uid;
 	os->gid = gid;
 	os->ucnt = ucnt;
+
+	memset(os->vol, -1, sizeof(os->vol));
+	memset(os->vol_set, -1, sizeof(os->vol));
 
 	list_add(&os->link, os_tbl_head(os->id));
 	list_add(&os->pgrp_link, os_pgrp_tbl_head(os->pgrp));
@@ -1127,9 +1219,10 @@ static void dsp_open_common(fuse_req_t req, struct fuse_file_info *fi,
 		goto err;
 	}
 
-	if (mixer->vol[PLAY][0] >= 0 || mixer->vol[REC][0] >= 0) {
+	memcpy(os->vol, mixer->vol, sizeof(os->vol));
+	if (os->vol[PLAY][0] >= 0 || os->vol[REC][0] >= 0) {
 		init_mixer_cmd(&mxcmd, mixer);
-		memcpy(mxcmd.set.vol, mixer->vol, sizeof(mixer->vol));
+		memcpy(mxcmd.set.vol, os->vol, sizeof(os->vol));
 		exec_mixer_cmd(&mxcmd, os);
 		finish_mixer_cmd(&mxcmd);
 	}
