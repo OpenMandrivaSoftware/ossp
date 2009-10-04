@@ -124,8 +124,10 @@ struct ossp_stream {
 
 struct ossp_dsp_stream {
 	struct ossp_stream	os;
+#ifdef OSSP_MMAP
 	int			mmap_fd[2];
 	int			nr_mmaps[2];
+#endif
 	int			mmapped;
 	int			nonblock;
 };
@@ -1389,7 +1391,10 @@ static void dsp_ioctl(fuse_req_t req, int signed_cmd, void *uarg,
 
 	case SNDCTL_DSP_GETCAPS:
 		i = DSP_CAP_DUPLEX | DSP_CAP_REALTIME | DSP_CAP_TRIGGER |
-			DSP_CAP_MULTI | DSP_CAP_MMAP;
+#ifdef OSSP_MMAP
+			DSP_CAP_MMAP |
+#endif
+			DSP_CAP_MULTI;
 		PREP_UARG(NULL, &i);
 		IOCTL_RETURN(0, &i);
 
@@ -1615,6 +1620,7 @@ repeat:
 	goto repeat;
 }
 
+#ifdef OSSP_MMAP
 static int dsp_mmap_dir(int prot)
 {
 	if (!(prot & PROT_WRITE))
@@ -1727,7 +1733,7 @@ out_unlock:
 out:
 	fuse_reply_none(req);
 }
-
+#endif
 
 /***************************************************************************
  * Stuff to bind and start everything
@@ -1814,9 +1820,11 @@ static const struct cuse_lowlevel_ops dsp_ops = {
 	.write			= dsp_write,
 	.poll			= dsp_poll,
 	.ioctl			= dsp_ioctl,
+#ifdef OSSP_MMAP
 	.mmap			= dsp_mmap,
 	.mmap_commit		= dsp_mmap_commit,
 	.munmap			= dsp_munmap,
+#endif
 };
 
 static const struct cuse_lowlevel_ops adsp_ops = {
@@ -1826,9 +1834,11 @@ static const struct cuse_lowlevel_ops adsp_ops = {
 	.write			= dsp_write,
 	.poll			= dsp_poll,
 	.ioctl			= dsp_ioctl,
+#ifdef OSSP_MMAP
 	.mmap			= dsp_mmap,
 	.mmap_commit		= dsp_mmap_commit,
 	.munmap			= dsp_munmap,
+#endif
 };
 
 static const char *usage =
