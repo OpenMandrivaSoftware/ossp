@@ -19,9 +19,17 @@ ifeq "$(origin OSSP_PADSP_LDFLAGS)" "undefined"
 OSSP_PADSP_LDFLAGS := $(shell pkg-config --libs libpulse)
 endif
 
+ifeq "$(origin OSSP_ALSAP_CFLAGS)" "undefined"
+OSSP_ALSAP_CFLAGS := $(shell pkg-config --libs alsa)
+endif
+
+ifeq "$(origin OSSP_ALSAP_LDFLAGS)" "undefined"
+OSSP_ALSAP_LDFLAGS := $(shell pkg-config --libs alsa)
+endif
+
 headers := ossp.h ossp-util.h
 
-all: osspd ossp-padsp
+all: osspd ossp-padsp ossp-alsap
 
 libossp.a: ossp.c ossp.h ossp-util.c ossp-util.h
 	$(CC) $(CFLAGS) -c -o ossp.o ossp.c
@@ -34,5 +42,8 @@ osspd: osspd.c libossp.a $(headers)
 ossp-padsp: ossp-padsp.c libossp.a $(headers)
 	$(CC) $(CFLAGS) $(OSSP_PADSP_CFLAGS) -o $@ $< $(OSSP_PADSP_LDFLAGS) $(LDFLAGS)
 
+ossp-alsap: ossp-alsap.c libossp.a $(headers)
+	$(CC) $(CFLAGS) $(OSSP_ALSAP_CFLAGS) -o $@ $< $(OSSP_ALSAP_LDFLAGS) $(LDFLAGS)
+
 clean:
-	rm -f *.o *.a osspd ossp-padsp
+	rm -f *.o *.a osspd ossp-padsp ossp-alsap
