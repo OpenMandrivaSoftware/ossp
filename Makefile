@@ -1,6 +1,7 @@
 CC := gcc
 AR := ar
 CFLAGS := -Wall $(CFLAGS)
+XLDFLAGS := $(LDFLAGS)
 LDFLAGS := -L. -lossp $(LDFLAGS)
 
 ifeq "$(origin OSSPD_CFLAGS)" "undefined"
@@ -45,5 +46,11 @@ ossp-padsp: ossp-padsp.c libossp.a $(headers)
 ossp-alsap: ossp-alsap.c libossp.a $(headers)
 	$(CC) $(CFLAGS) $(OSSP_ALSAP_CFLAGS) -o $@ $< $(OSSP_ALSAP_LDFLAGS) $(LDFLAGS)
 
+osstest: osstest.c
+	$(CC) $(CFLAGS) -o $@ $< $(XLDFLAGS)
+
+test: osstest
+	@./osstest
+
 clean:
-	rm -f *.o *.a osspd ossp-padsp ossp-alsap
+	rm -f *.o *.a osspd ossp-padsp ossp-alsap osstest
