@@ -1031,6 +1031,58 @@ static void put_os(struct ossp_stream *os)
 	free(os);
 }
 
+static void set_extra_env(pid_t pid)
+{
+	char procenviron[32];
+	const int step = 1024;
+	char *data = malloc(step + 1);
+	int ofs = 0;
+	int fd;
+	int ret;
+
+	if (!data)
+		return;
+
+	sprintf(procenviron, "/proc/%d/environ", pid);
+	fd = open(procenviron, O_RDONLY);
+	if (fd < 0)
+		return;
+
+	/*
+	 * There should really be a 'read whole file to a newly allocated
+	 * buffer' function.
+	 */
+	while ((ret = read(fd, data + ofs, step)) > 0) {
+		char *newdata;
+		ofs += ret;
+		newdata = realloc(data, ofs + step + 1);
+		if (!newdata) {
+			ret = -1;
+			break;
+		}
+		data = newdata;
+	}
+	if (ret == 0) {
+		char *ptr = data;
+		/* Append the extra 0 for end condition */
+		data[ofs] = 0;
+
+		while ((ret = strlen(ptr)) > 0) {
+			/*
+			 * Copy all PULSE variables and DISPLAY so that
+			 * ssh -X remotehost 'mplayer -ao oss' will work
+			 */
+			if (!strncmp(ptr, "DISPLAY=", 8) ||
+			    !strncmp(ptr, "PULSE_", 6))
+				putenv(ptr);
+			ptr += ret + 1;
+		}
+	}
+
+	free(data);
+	close(fd);
+}
+
 static int create_os(const char *slave_path, size_t stream_size,
 		     pid_t pid, pid_t pgrp, uid_t uid, gid_t gid,
 		     struct ossp_stream **osp)
@@ -1131,6 +1183,8 @@ static int create_os(const char *slave_path, size_t stream_size,
 			setenv("USER", pwd->pw_name, 1);
 			setenv("HOME", pwd->pw_dir, 1);
 		}
+		/* Set extra environment variables from the caller */
+		set_extra_env(pid);
 
 		/* prep and exec */
 		slave_path_copy[sizeof(slave_path_copy) - 1] = '\0';
