@@ -1,8 +1,13 @@
+# These can be overridden if needed
+# DESTDIR is completely respected
 CC := gcc
 AR := ar
 CFLAGS := -Wall $(CFLAGS)
 XLDFLAGS := $(LDFLAGS)
 LDFLAGS := -L. -lossp $(LDFLAGS)
+prefix := /usr/local
+DESTDIR :=
+UDEVDIR := /etc/udev/rules.d
 
 ifeq "$(origin OSSPD_CFLAGS)" "undefined"
 OSSPD_CFLAGS := $(shell pkg-config --cflags fuse)
@@ -31,6 +36,12 @@ endif
 headers := ossp.h ossp-util.h
 
 all: osspd ossp-padsp ossp-alsap
+
+install:
+	mkdir -p $(DESTDIR)$(prefix)/sbin
+	install -m755 osspd ossp-padsp ossp-alsap $(DESTDIR)$(prefix)/sbin
+	mkdir -p $(DESTDIR)$(UDEVDIR)
+	install -m644 98-osscuse.rules $(DESTDIR)$(UDEVDIR)
 
 libossp.a: ossp.c ossp.h ossp-util.c ossp-util.h
 	$(CC) $(CFLAGS) -c -o ossp.o ossp.c
