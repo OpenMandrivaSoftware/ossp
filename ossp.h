@@ -14,7 +14,7 @@
 #include <inttypes.h>
 #include <sys/soundcard.h>
 
-#define OSSP_VERSION		"1.3"
+#define OSSP_VERSION		"1.3.1"
 #define OSSP_CMD_MAGIC		0xdeadbeef
 #define OSSP_REPLY_MAGIC	0xbeefdead
 #define OSSP_NOTIFY_MAGIC	0xbebebebe
