@@ -1172,18 +1172,16 @@ static int create_os(const char *slave_path, size_t stream_size,
 
 	if (os->slave_pid == 0) {
 		/* child */
-		char fd_str[2][16], log_str[16], slave_path_copy[PATH_MAX];
-		char *argv[] = { slave_path_copy, "-c", fd_str[0],
+		char id_str[2][16], fd_str[2][16];
+		char log_str[16], slave_path_copy[PATH_MAX];
+		char *argv[] = { slave_path_copy, "-u", id_str[0],
+				 "-g", id_str[1], "-c", fd_str[0],
 				 "-n", fd_str[1], "-l", log_str, NULL, NULL };
 		struct passwd *pwd;
 
 		/* drop stuff we don't need */
 		if (close(cmd_sock[0]) || close(notify_sock[0]))
 			fatal_e(-errno, "failed to close server pipe fds");
-
-		if (setresgid(os->gid, os->gid, os->gid) ||
-		    setresuid(os->uid, os->uid, os->uid))
-			fatal_e(-errno, "failed to drop privileges");
 
 		clearenv();
 		pwd = getpwuid(os->uid);
@@ -1204,6 +1202,8 @@ static int create_os(const char *slave_path, size_t stream_size,
 			goto child_fail;
 		}
 
+		snprintf(id_str[0], sizeof(id_str[0]), "%d", os->uid);
+		snprintf(id_str[1], sizeof(id_str[0]), "%d", os->gid);
 		snprintf(fd_str[0], sizeof(fd_str[0]), "%d", cmd_sock[1]);
 		snprintf(fd_str[1], sizeof(fd_str[1]), "%d", notify_sock[1]);
 		snprintf(log_str, sizeof(log_str), "%d", ossp_log_level);

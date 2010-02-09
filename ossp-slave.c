@@ -26,6 +26,8 @@ static const char *usage =
 "proxies commands from osspd to pulseaudio\n"
 "\n"
 "options:\n"
+"    -u UID            uid to use\n"
+"    -g GID            gid to use\n"
 "    -c CMD_FD         fd to receive commands from osspd\n"
 "    -n NOTIFY_FD      fd to send async notifications to osspd\n"
 "    -l LOG_LEVEL      set log level\n"
@@ -36,13 +38,24 @@ int ossp_cmd_fd = -1, ossp_notify_fd = -1;
 
 void ossp_slave_init(int argc, char **argv)
 {
+	int have_uid = 0, have_gid = 0;
+	uid_t uid;
+	gid_t gid;
 	int opt;
 	struct passwd *pw, pw_buf;
 	struct sigaction sa;
 	char pw_sbuf[sysconf(_SC_GETPW_R_SIZE_MAX)];
 
-	while ((opt = getopt(argc, argv, "c:n:l:t")) != -1) {
+	while ((opt = getopt(argc, argv, "u:g:c:n:l:t")) != -1) {
 		switch (opt) {
+		case 'u':
+			have_uid = 1;
+			uid = strtol(optarg, NULL, 0);
+			break;
+		case 'g':
+			have_gid = 1;
+			gid = strtol(optarg, NULL, 0);
+			break;
 		case 'c':
 			ossp_cmd_fd = strtol(optarg, NULL, 0);
 			break;
@@ -58,18 +71,22 @@ void ossp_slave_init(int argc, char **argv)
 		}
 	}
 
-	if (ossp_cmd_fd < 0 || ossp_notify_fd < 0) {
+	if (!have_uid || !have_gid || ossp_cmd_fd < 0 || ossp_notify_fd < 0) {
 		fprintf(stderr, usage);
 		_exit(1);
 	}
 
-	snprintf(ossp_user_name, sizeof(ossp_user_name), "uid%d", getuid());
-	if (getpwuid_r(getuid(), &pw_buf, pw_sbuf, sizeof(pw_sbuf), &pw) == 0)
+	snprintf(ossp_user_name, sizeof(ossp_user_name), "uid%d", uid);
+	if (getpwuid_r(uid, &pw_buf, pw_sbuf, sizeof(pw_sbuf), &pw) == 0)
 		snprintf(ossp_user_name, sizeof(ossp_user_name), "%s",
 			 pw->pw_name);
 
 	snprintf(ossp_log_name, sizeof(ossp_log_name), "ossp-padsp[%s:%d]",
 		 ossp_user_name, getpid());
+
+	/* drop privileges */
+	if (setresgid(gid, gid, gid) || setresuid(uid, uid, uid))
+		fatal_e(-errno, "failed to drop privileges");
 
 	/* block SIGPIPE */
 	memset(&sa, 0, sizeof(sa));
