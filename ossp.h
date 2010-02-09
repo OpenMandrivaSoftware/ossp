@@ -1,8 +1,8 @@
 /*
  * ossp - OSS Proxy: emulate OSS device using CUSE
  *
- * Copyright (C) 2008-2009  SUSE Linux Products GmbH
- * Copyright (C) 2008-2009  Tejun Heo <tj@kernel.org>
+ * Copyright (C) 2008-2010  SUSE Linux Products GmbH
+ * Copyright (C) 2008-2010  Tejun Heo <tj@kernel.org>
  *
  * This file is released under the GPLv2.
  */
@@ -14,7 +14,7 @@
 #include <inttypes.h>
 #include <sys/soundcard.h>
 
-#define OSSP_VERSION		"1.3.1"
+#define OSSP_VERSION		"1.3.2"
 #define OSSP_CMD_MAGIC		0xdeadbeef
 #define OSSP_REPLY_MAGIC	0xbeefdead
 #define OSSP_NOTIFY_MAGIC	0xbebebebe
