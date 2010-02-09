@@ -1572,108 +1572,6 @@ err:
 	fuse_reply_err(req, -ret);
 }
 
-
-/***************************************************************************
- * Notify poller
- */
-
-static void *notify_poller(void *arg)
-{
-	struct epoll_event events[1024];
-	int i, nfds;
-
-repeat:
-	nfds = epoll_wait(notify_epfd, events, ARRAY_SIZE(events), -1);
-	for (i = 0; i < nfds; i++) {
-		int do_notify = 0;
-		struct ossp_stream *os;
-		struct ossp_notify notify;
-		ssize_t ret;
-
-		os = find_os_by_notify_rx(events[i].data.fd);
-		if (!os) {
-			err("can't find stream for notify_rx fd %d",
-			    events[i].data.fd);
-			epoll_ctl(notify_epfd, EPOLL_CTL_DEL, events[i].data.fd,
-				  NULL);
-			/* we don't know what's going on, don't close the fd */
-			continue;
-		}
-
-		while ((ret = read(os->notify_rx,
-				   &notify, sizeof(notify))) > 0) {
-			if (os->dead)
-				continue;
-			if (ret != sizeof(notify)) {
-				warn_os(os, "short read on notify_rx (%zu, "
-					"expected %zu), killing the stream",
-					ret, sizeof(notify));
-				os->dead = 1;
-				break;
-			}
-			if (notify.magic != OSSP_NOTIFY_MAGIC) {
-				warn_os(os, "invalid magic on notification, "
-					"killing the stream");
-				os->dead = 1;
-				break;
-			}
-
-			if (notify.opcode >= OSSP_NR_NOTIFY_OPCODES)
-				goto unknown;
-
-			dbg1_os(os, "NOTIFY %s", ossp_notify_str[notify.opcode]);
-
-			switch (notify.opcode) {
-			case OSSP_NOTIFY_POLL:
-				do_notify = 1;
-				break;
-			case OSSP_NOTIFY_OBITUARY:
-				os->dead = 1;
-				break;
-			case OSSP_NOTIFY_VOLCHG:
-				pthread_mutex_lock(&mixer_mutex);
-				os->mixer->modify_counter++;
-				pthread_mutex_unlock(&mixer_mutex);
-				break;
-			default:
-			unknown:
-				warn_os(os, "unknown notification %d",
-					notify.opcode);
-			}
-		}
-		if (ret == 0)
-			os->dead = 1;
-		else if (ret < 0 && errno != EAGAIN) {
-			warn_ose(os, -errno, "read fail on notify fd");
-			os->dead = 1;
-		}
-
-		if (!do_notify && !os->dead)
-			continue;
-
-		pthread_mutex_lock(&mutex);
-
-		if (os->ph) {
-			fuse_lowlevel_notify_poll(os->ph);
-			fuse_pollhandle_destroy(os->ph);
-			os->ph = NULL;
-		}
-
-		if (os->dead) {
-			dbg0_os(os, "removing %d from notify poll list",
-				os->notify_rx);
-			epoll_ctl(notify_epfd, EPOLL_CTL_DEL, os->notify_rx,
-				  NULL);
-			close(os->notify_rx);
-			os->notify_rx = -1;
-			pthread_cond_broadcast(&notify_poller_kill_wait);
-		}
-
-		pthread_mutex_unlock(&mutex);
-	}
-	goto repeat;
-}
-
 #ifdef OSSP_MMAP
 static int dsp_mmap_dir(int prot)
 {
@@ -1788,6 +1686,109 @@ out:
 	fuse_reply_none(req);
 }
 #endif
+
+
+/***************************************************************************
+ * Notify poller
+ */
+
+static void *notify_poller(void *arg)
+{
+	struct epoll_event events[1024];
+	int i, nfds;
+
+repeat:
+	nfds = epoll_wait(notify_epfd, events, ARRAY_SIZE(events), -1);
+	for (i = 0; i < nfds; i++) {
+		int do_notify = 0;
+		struct ossp_stream *os;
+		struct ossp_notify notify;
+		ssize_t ret;
+
+		os = find_os_by_notify_rx(events[i].data.fd);
+		if (!os) {
+			err("can't find stream for notify_rx fd %d",
+			    events[i].data.fd);
+			epoll_ctl(notify_epfd, EPOLL_CTL_DEL, events[i].data.fd,
+				  NULL);
+			/* we don't know what's going on, don't close the fd */
+			continue;
+		}
+
+		while ((ret = read(os->notify_rx,
+				   &notify, sizeof(notify))) > 0) {
+			if (os->dead)
+				continue;
+			if (ret != sizeof(notify)) {
+				warn_os(os, "short read on notify_rx (%zu, "
+					"expected %zu), killing the stream",
+					ret, sizeof(notify));
+				os->dead = 1;
+				break;
+			}
+			if (notify.magic != OSSP_NOTIFY_MAGIC) {
+				warn_os(os, "invalid magic on notification, "
+					"killing the stream");
+				os->dead = 1;
+				break;
+			}
+
+			if (notify.opcode >= OSSP_NR_NOTIFY_OPCODES)
+				goto unknown;
+
+			dbg1_os(os, "NOTIFY %s", ossp_notify_str[notify.opcode]);
+
+			switch (notify.opcode) {
+			case OSSP_NOTIFY_POLL:
+				do_notify = 1;
+				break;
+			case OSSP_NOTIFY_OBITUARY:
+				os->dead = 1;
+				break;
+			case OSSP_NOTIFY_VOLCHG:
+				pthread_mutex_lock(&mixer_mutex);
+				os->mixer->modify_counter++;
+				pthread_mutex_unlock(&mixer_mutex);
+				break;
+			default:
+			unknown:
+				warn_os(os, "unknown notification %d",
+					notify.opcode);
+			}
+		}
+		if (ret == 0)
+			os->dead = 1;
+		else if (ret < 0 && errno != EAGAIN) {
+			warn_ose(os, -errno, "read fail on notify fd");
+			os->dead = 1;
+		}
+
+		if (!do_notify && !os->dead)
+			continue;
+
+		pthread_mutex_lock(&mutex);
+
+		if (os->ph) {
+			fuse_lowlevel_notify_poll(os->ph);
+			fuse_pollhandle_destroy(os->ph);
+			os->ph = NULL;
+		}
+
+		if (os->dead) {
+			dbg0_os(os, "removing %d from notify poll list",
+				os->notify_rx);
+			epoll_ctl(notify_epfd, EPOLL_CTL_DEL, os->notify_rx,
+				  NULL);
+			close(os->notify_rx);
+			os->notify_rx = -1;
+			pthread_cond_broadcast(&notify_poller_kill_wait);
+		}
+
+		pthread_mutex_unlock(&mutex);
+	}
+	goto repeat;
+}
+
 
 /***************************************************************************
  * Stuff to bind and start everything
