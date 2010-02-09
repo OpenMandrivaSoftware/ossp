@@ -145,11 +145,6 @@ typedef ssize_t (*ossp_action_fn_t)(enum ossp_opcode opcode,
 int get_proc_self_info(pid_t tid, pid_t *pgrp,
 		       char *cmd_buf, size_t cmd_buf_sz);
 
-int ossp_slave_process_command(int cmd_fd,
-			       ossp_action_fn_t const *action_fn_tbl,
-			       int (*action_pre_fn)(void),
-			       void (*action_post_fn)(void));
-
 /*
  * Doubly linked list handling code shamelessly stolen from the Linux
  * kernel 2.6.26 include/linux/list.h.

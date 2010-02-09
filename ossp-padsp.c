@@ -16,7 +16,6 @@
 #include <poll.h>
 #include <pthread.h>
 #include <pwd.h>
-#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -28,8 +27,7 @@
 #include <pulse/pulseaudio.h>
 #include <sys/soundcard.h>
 
-#include "ossp.h"
-#include "ossp-util.h"
+#include "ossp-slave.h"
 
 enum {
 	AFMT_FLOAT		= 0x00004000,
@@ -62,11 +60,9 @@ static struct stream_params stream_params[] = {
 };
 
 static size_t page_size;
-static int cmd_fd = -1, notify_fd = -1;
 static pa_context *context;
 static pa_threaded_mainloop *mainloop;
 static pa_mainloop_api *mainloop_api;
-static char username[128];
 static char stream_name[128];
 static int stream_enabled[2];
 static int stream_corked[2];
@@ -114,17 +110,6 @@ static const char *dir_str[] = {
 	[PLAY]		= "PLAY",
 	[REC]		= "REC",
 };
-
-static const char *usage =
-"usage: ossp-padsp -c CMD_FD -n NOTIFY_FD [-d]\n"
-"\n"
-"proxies commands from osspd to pulseaudio\n"
-"\n"
-"options:\n"
-"    -c CMD_FD         fd to receive commands from osspd\n"
-"    -n NOTIFY_FD      fd to send async notifications to osspd\n"
-"    -l LOG_LEVEL      set log level\n"
-"    -t                enable log timestamps\n";
 
 static void stream_rw_callback(pa_stream *s, size_t length, void *userdata);
 
@@ -732,7 +717,7 @@ static void context_subscribe_callback(pa_context *context,
 	    PA_SUBSCRIPTION_EVENT_CHANGE)
 		return;
 
-	ret = write(notify_fd, &event, sizeof(event));
+	ret = write(ossp_notify_fd, &event, sizeof(event));
 	if (ret != sizeof(event) && errno != EPIPE)
 		warn_e(-errno, "write to notify_fd failed");
 }
@@ -763,7 +748,7 @@ static ssize_t padsp_open(enum ossp_opcode opcode,
 	/* determine stream name */
 	gethostname(host_name, sizeof(host_name) - 1);
 	snprintf(stream_name, sizeof(stream_name), "OSS Proxy %s/%s:%ld",
-		 host_name, username, (long)arg->opener_pid);
+		 host_name, ossp_user_name, (long)arg->opener_pid);
 
 	/* create and connect PA context */
 	get_proc_self_info(arg->opener_pid, NULL, opener, sizeof(opener));
@@ -1017,7 +1002,7 @@ static void stream_rw_callback(pa_stream *s, size_t length, void *userdata)
 					     .opcode = OSSP_NOTIFY_POLL };
 		ssize_t ret;
 
-		ret = write(notify_fd, &event, sizeof(event));
+		ret = write(ossp_notify_fd, &event, sizeof(event));
 		if (ret != sizeof(event)) {
 			if (errno != EPIPE)
 				err_e(-errno, "write to notify_fd failed");
@@ -1531,48 +1516,11 @@ static void action_post(void)
 
 int main(int argc, char **argv)
 {
-	struct passwd *pw, pw_buf;
-	char pw_sbuf[sysconf(_SC_GETPW_R_SIZE_MAX)];
-	struct sigaction sa;
-	int opt, rc;
+	int rc;
+
+	ossp_slave_init(argc, argv);
 
 	page_size = sysconf(_SC_PAGE_SIZE);
-
-	snprintf(username, sizeof(username), "uid%d", getuid());
-	if (getpwuid_r(getuid(), &pw_buf, pw_sbuf, sizeof(pw_sbuf), &pw) == 0)
-		snprintf(username, sizeof(username), "%s", pw->pw_name);
-
-	snprintf(ossp_log_name, sizeof(ossp_log_name), "ossp-padsp[%s:%d]",
-		 username, getpid());
-
-	while ((opt = getopt(argc, argv, "c:r:n:l:t")) != -1) {
-		switch (opt) {
-		case 'c':
-			cmd_fd = atoi(optarg);
-			break;
-		case 'n':
-			notify_fd = atoi(optarg);
-			break;
-		case 'l':
-			ossp_log_level = atoi(optarg);
-			break;
-		case 't':
-			ossp_log_timestamp = 1;
-			break;
-		}
-	}
-
-	if (cmd_fd < 0 || notify_fd < 0) {
-		fprintf(stderr, usage);
-		return 1;
-	}
-
-	memset(&sa, 0, sizeof(sa));
-	sa.sa_handler = SIG_IGN;
-	if (sigaction(SIGPIPE, &sa, NULL)) {
-		err_e(-errno, "failed to ignore SIGPIPE");
-		return 1;
-	}
 
 	mainloop = pa_threaded_mainloop_new();
 	if (!mainloop) {
@@ -1589,7 +1537,7 @@ int main(int argc, char **argv)
 	/* Okay, now we're open for business */
 	rc = 0;
 	do {
-		rc = ossp_slave_process_command(cmd_fd, action_fn_tbl,
+		rc = ossp_slave_process_command(ossp_cmd_fd, action_fn_tbl,
 						action_pre, action_post);
 	} while (rc > 0 && !fail_code);
 	if (rc)

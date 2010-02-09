@@ -18,7 +18,6 @@
 #include <poll.h>
 #include <pthread.h>
 #include <pwd.h>
-#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -30,8 +29,7 @@
 #include <alsa/asoundlib.h>
 #include <sys/soundcard.h>
 
-#include "ossp.h"
-#include "ossp-util.h"
+#include "ossp-slave.h"
 
 enum {
 	AFMT_FLOAT		= 0x00004000,
@@ -40,8 +38,6 @@ enum {
 };
 
 static size_t page_size;
-static int cmd_fd = -1, notify_fd = -1;
-static char username[128];
 
 /* alsa structures */
 static snd_pcm_t *pcm[2];
@@ -71,17 +67,6 @@ static struct ring_buf mmap_stg[2];	/* staging ring buffer */
 static size_t mmap_lead[2];		/* lead bytes */
 static int mmap_sync[2];		/* sync with backend stream */
 #endif
-
-static const char *usage =
-"usage: ossp-alsap -c CMD_FD -n NOTIFY_FD [-d]\n"
-"\n"
-"proxies commands from osspd to alsa\n"
-"\n"
-"options:\n"
-"    -c CMD_FD         fd to receive commands from osspd\n"
-"    -n NOTIFY_FD      fd to send async notifications to osspd\n"
-"    -l LOG_LEVEL      set log level\n"
-"    -t                enable log timestamps\n";
 
 static snd_pcm_format_t fmt_oss_to_alsa(int fmt)
 {
@@ -591,53 +576,16 @@ static void action_post(void)
 
 int main(int argc, char **argv)
 {
-	struct passwd *pw, pw_buf;
-	char pw_sbuf[sysconf(_SC_GETPW_R_SIZE_MAX)];
-	struct sigaction sa;
-	int opt, rc;
+	int rc;
+
+	ossp_slave_init(argc, argv);
 
 	page_size = sysconf(_SC_PAGE_SIZE);
-
-	snprintf(username, sizeof(username), "uid%d", getuid());
-	if (getpwuid_r(getuid(), &pw_buf, pw_sbuf, sizeof(pw_sbuf), &pw) == 0)
-		snprintf(username, sizeof(username), "%s", pw->pw_name);
-
-	snprintf(ossp_log_name, sizeof(ossp_log_name), "ossp-alsap[%s:%d]",
-		 username, getpid());
-
-	while ((opt = getopt(argc, argv, "c:r:n:l:t")) != -1) {
-		switch (opt) {
-		case 'c':
-			cmd_fd = atoi(optarg);
-			break;
-		case 'n':
-			notify_fd = atoi(optarg);
-			break;
-		case 'l':
-			ossp_log_level = atoi(optarg);
-			break;
-		case 't':
-			ossp_log_timestamp = 1;
-			break;
-		}
-	}
-
-	if (cmd_fd < 0 || notify_fd < 0) {
-		fprintf(stderr, usage);
-		return 1;
-	}
-
-	memset(&sa, 0, sizeof(sa));
-	sa.sa_handler = SIG_IGN;
-	if (sigaction(SIGPIPE, &sa, NULL)) {
-		err_e(-errno, "failed to ignore SIGPIPE");
-		return 1;
-	}
 
 	/* Okay, now we're open for business */
 	rc = 0;
 	do {
-		rc = ossp_slave_process_command(cmd_fd, action_fn_tbl,
+		rc = ossp_slave_process_command(ossp_cmd_fd, action_fn_tbl,
 						action_pre, action_post);
 	} while (rc > 0);
 

@@ -33,7 +33,7 @@ ifeq "$(origin OSSP_ALSAP_LDFLAGS)" "undefined"
 OSSP_ALSAP_LDFLAGS := $(shell pkg-config --libs alsa)
 endif
 
-headers := ossp.h ossp-util.h
+headers := ossp.h ossp-util.h ossp-slave.h
 
 all: osspd ossp-padsp ossp-alsap
 
@@ -43,10 +43,11 @@ install:
 	mkdir -p $(DESTDIR)$(UDEVDIR)
 	install -m644 98-osscuse.rules $(DESTDIR)$(UDEVDIR)
 
-libossp.a: ossp.c ossp.h ossp-util.c ossp-util.h
+libossp.a: ossp.c ossp.h ossp-util.c ossp-util.h ossp-slave.c ossp-slave.h
 	$(CC) $(CFLAGS) -c -o ossp.o ossp.c
 	$(CC) $(CFLAGS) -c -o ossp-util.o ossp-util.c
-	$(AR) rc $@ ossp.o ossp-util.o
+	$(CC) $(CFLAGS) -c -o ossp-slave.o ossp-slave.c
+	$(AR) rc $@ ossp.o ossp-util.o ossp-slave.o
 
 osspd: osspd.c libossp.a $(headers)
 	$(CC) $(CFLAGS) $(OSSPD_CFLAGS) -o $@ $< $(OSSPD_LDFLAGS) $(LDFLAGS)
