@@ -1104,13 +1104,13 @@ static int create_os(const char *slave_path, size_t stream_size,
 	if (socketpair(AF_UNIX, SOCK_STREAM, 0, cmd_sock) ||
 	    socketpair(AF_UNIX, SOCK_STREAM, 0, notify_sock)) {
 		rc = -errno;
-		warn_ose(os, rc, "failed to create slave command channel");
+		warn_e(rc, "failed to create slave command channel");
 		goto close_all;
 	}
 
 	if (fcntl(notify_sock[0], F_SETFL, O_NONBLOCK) < 0) {
 		rc = -errno;
-		warn_ose(os, rc, "failed to set NONBLOCK on notify sock");
+		warn_e(rc, "failed to set NONBLOCK on notify sock");
 		goto close_all;
 	}
 
@@ -1769,7 +1769,7 @@ static void dsp_munmap(fuse_req_t req, void *addr, size_t len,
 		if (dsps->nr_mmaps[dir] && dsps->mmap_fd[dir] == fd)
 			break;
 	if (dir == 2) {
-		warn_os(os, "invalid munmap request for fd %d (%d:%d %d:%d)\n",
+		warn_os(os, "invalid munmap request for fd %d (%d:%d %d:%d)",
 			fd, dsps->nr_mmaps[PLAY], dsps->mmap_fd[PLAY],
 			dsps->nr_mmaps[REC], dsps->mmap_fd[REC]);
 		goto out_unlock;
@@ -1780,7 +1780,7 @@ static void dsp_munmap(fuse_req_t req, void *addr, size_t len,
 
 	rc = exec_simple_cmd(os, OSSP_DSP_MUNMAP, &dir, NULL);
 	if (rc)
-		warn_ose(os, rc, "MUNMAP failed for dir=%d fd=%d\n", dir, fd);
+		warn_ose(os, rc, "MUNMAP failed for dir=%d fd=%d", dir, fd);
 
 out_unlock:
 	pthread_mutex_unlock(&os->mmap_mutex);
@@ -1840,7 +1840,7 @@ static void ossp_daemonize(void)
 	if (ret == sizeof(err) && err == 0)
 		exit(0);
 
-	fatal("daemon init failed ret=%zd err=%d\n", ret, err);
+	fatal("daemon init failed ret=%zd err=%d", ret, err);
 	exit(1);
 }
 
