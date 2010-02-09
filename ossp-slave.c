@@ -10,6 +10,7 @@
 #define _GNU_SOURCE
 
 #include <sys/types.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <stdio.h>
@@ -30,23 +31,30 @@ static const char *usage =
 "    -g GID            gid to use\n"
 "    -c CMD_FD         fd to receive commands from osspd\n"
 "    -n NOTIFY_FD      fd to send async notifications to osspd\n"
+"    -m MMAP_FD        fd to use for mmap\n"
+"    -o MMAP_OFFSET    mmap offset\n"
+"    -s MMAP_SIZE      mmap size\n"
 "    -l LOG_LEVEL      set log level\n"
 "    -t                enable log timestamps\n";
 
 char ossp_user_name[OSSP_USER_NAME_LEN];
 int ossp_cmd_fd = -1, ossp_notify_fd = -1;
+void *ossp_mmap_addr[2];
 
 void ossp_slave_init(int argc, char **argv)
 {
 	int have_uid = 0, have_gid = 0;
 	uid_t uid;
 	gid_t gid;
+	int mmap_fd = -1;
+	off_t mmap_off = 0;
+	size_t mmap_size = 0;
 	int opt;
 	struct passwd *pw, pw_buf;
 	struct sigaction sa;
 	char pw_sbuf[sysconf(_SC_GETPW_R_SIZE_MAX)];
 
-	while ((opt = getopt(argc, argv, "u:g:c:n:l:t")) != -1) {
+	while ((opt = getopt(argc, argv, "u:g:c:n:m:o:s:l:t")) != -1) {
 		switch (opt) {
 		case 'u':
 			have_uid = 1;
@@ -61,6 +69,15 @@ void ossp_slave_init(int argc, char **argv)
 			break;
 		case 'n':
 			ossp_notify_fd = strtol(optarg, NULL, 0);
+			break;
+		case 'm':
+			mmap_fd = strtol(optarg, NULL, 0);
+			break;
+		case 'o':
+			mmap_off = strtoull(optarg, NULL, 0);
+			break;
+		case 's':
+			mmap_size = strtoul(optarg, NULL, 0);
 			break;
 		case 'l':
 			ossp_log_level = strtol(optarg, NULL, 0);
@@ -84,7 +101,25 @@ void ossp_slave_init(int argc, char **argv)
 	snprintf(ossp_log_name, sizeof(ossp_log_name), "ossp-padsp[%s:%d]",
 		 ossp_user_name, getpid());
 
-	/* drop privileges */
+	if (mmap_fd >= 0) {
+		void *p;
+
+		if (!mmap_off || !mmap_size) {
+			fprintf(stderr, usage);
+			_exit(1);
+		}
+
+		p = mmap(NULL, mmap_size, PROT_READ | PROT_WRITE, MAP_SHARED,
+			 mmap_fd, mmap_off);
+		if (p == MAP_FAILED)
+			fatal_e(-errno, "mmap failed");
+
+		ossp_mmap_addr[PLAY] = p;
+		ossp_mmap_addr[REC] = p + mmap_size / 2;
+		close(mmap_fd);
+	}
+
+	/* mmap done, drop privileges */
 	if (setresgid(gid, gid, gid) || setresuid(uid, uid, uid))
 		fatal_e(-errno, "failed to drop privileges");
 

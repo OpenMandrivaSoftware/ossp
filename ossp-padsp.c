@@ -19,7 +19,6 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
-#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -98,7 +97,6 @@ static size_t prebuf_size;
 
 /* mmap stuff */
 static size_t mmap_raw_size, mmap_size;
-static int mmap_fd[2] = { -1, -1 };
 static void *mmap_map[2];
 static uint64_t mmap_idx[2];		/* mmap pointer */
 static uint64_t mmap_last_idx[2];	/* last idx for get_ptr */
@@ -1153,10 +1151,8 @@ static ssize_t padsp_mmap(enum ossp_opcode opcode,
 {
 	struct ossp_dsp_mmap_arg *arg = carg;
 	int dir = arg->dir;
-	void *map;
-	int rc;
 
-	assert(!mmap_map[dir] && mmap_fd[dir] < 0);
+	assert(!mmap_map[dir]);
 
 	kill_streams();
 
@@ -1174,25 +1170,9 @@ static ssize_t padsp_mmap(enum ossp_opcode opcode,
 		mmap_raw_size = user_max_length;
 	}
 
-	if (ftruncate(tfd, mmap_raw_size)) {
-		rc = -errno;
-		warn_e(rc, "failed to resize mmap file to %zu bytes",
-		       mmap_raw_size);
-		return rc;
-	}
+	dbg0("MMAP server-addr=%p sz=%zu", ossp_mmap_addr[dir], mmap_raw_size);
 
-	map = mmap(NULL, mmap_raw_size, PROT_READ | PROT_WRITE, MAP_SHARED,
-		   tfd, 0);
-	if (map == MAP_FAILED) {
-		rc = -errno;
-		warn_e(rc, "failed to mmap the mmap file, fd=%d sz=%zu",
-		       tfd, mmap_raw_size);
-		return rc;
-	}
-	dbg0("MMAP fd=%d map=%p sz=%zu", tfd, map, mmap_raw_size);
-
-	mmap_fd[dir] = tfd;
-	mmap_map[dir] = map;
+	mmap_map[dir] = ossp_mmap_addr[dir];
 
 	/* if mmapped, only mmapped streams are enabled */
 	stream_enabled[PLAY] = !!mmap_map[PLAY];
@@ -1206,29 +1186,11 @@ static ssize_t padsp_munmap(enum ossp_opcode opcode,
 			    void *rarg, void *dout, size_t *dout_szp, int tfd)
 {
 	int dir = *(int *)carg;
-	int fd = mmap_fd[dir];
-	void *map = mmap_map[dir];
-	int rc = 0;
 
-	assert(map && fd >= 0);
-
+	assert(mmap_map[dir]);
 	kill_streams();
-
-	mmap_fd[dir] = -1;
 	mmap_map[dir] = NULL;
-
-	if (munmap(map, mmap_raw_size)) {
-		rc = -errno;
-		warn_e(rc, "munmap for %s failed, map=%p size=%zu",
-		       dir_str[dir], map, mmap_raw_size);
-	}
-
-	if (close(fd)) {
-		rc = -errno;
-		warn_e(rc, "close for %s failed, fd=%d", dir_str[dir], fd);
-	}
-
-	return rc;
+	return 0;
 }
 
 static ssize_t padsp_flush(enum ossp_opcode opcode,

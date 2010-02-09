@@ -34,6 +34,16 @@
 #include "ossp.h"
 #include "ossp-util.h"
 
+/*
+ * If FUSE_MMAP_DONT_COPY is defined, we're building against libfuse
+ * w/ direct mmap support.  Define OSSP_MMAP.
+ */
+#ifdef FUSE_MMAP_DONT_COPY
+#define OSSP_MMAP
+#else
+#warning libfuse is missing direct mmap support, disabling mmap
+#endif
+
 #define DFL_MIXER_NAME		"mixer"
 #define DFL_DSP_NAME		"dsp"
 #define DFL_ADSP_NAME		"adsp"
@@ -59,6 +69,8 @@ enum {
 	DFL_ADSP_MINOR		= 12,
 	DFL_MAX_STREAMS		= 128,
 	MIXER_PUT_DELAY		= 600,			/* 10 mins */
+	/* DSPS_MMAP_SIZE / 2 must be multiple of SHMLBA */
+	DSPS_MMAP_SIZE		= 2 * (512 << 10),	/* 512k for each dir */
 };
 
 struct ossp_uid_cnt {
@@ -118,6 +130,9 @@ struct ossp_stream {
 	int			vol[2][2];
 	int			vol_set[2][2];
 
+	off_t			mmap_off;
+	size_t			mmap_size;
+
 	struct ossp_uid_cnt	*ucnt;
 	struct fuse_session	*se;	/* associated fuse session */
 	struct ossp_mixer	*mixer;
@@ -125,11 +140,7 @@ struct ossp_stream {
 
 struct ossp_dsp_stream {
 	struct ossp_stream	os;
-#ifdef OSSP_MMAP
-	int			mmap_fd[2];
-	int			nr_mmaps[2];
-#endif
-	int			mmapped;
+	unsigned		mmapped;
 	int			nonblock;
 };
 
@@ -889,9 +900,10 @@ static void mixer_release(fuse_req_t req, struct fuse_file_info *fi)
  * Stream implementation
  */
 
-static int alloc_os(size_t stream_size, pid_t pid, uid_t pgrp,
+static int alloc_os(size_t stream_size, size_t mmap_size, pid_t pid, uid_t pgrp,
 		    uid_t uid, gid_t gid, int cmd_sock,
-		    const int *notify, struct ossp_stream **osp)
+		    const int *notify, struct fuse_session *se,
+		    struct ossp_stream **osp)
 {
 	struct ossp_uid_cnt *tmp_ucnt, *ucnt = NULL;
 	struct ossp_stream *os;
@@ -949,7 +961,12 @@ static int alloc_os(size_t stream_size, pid_t pid, uid_t pgrp,
 	os->pgrp = pgrp;
 	os->uid = uid;
 	os->gid = gid;
+	if (mmap_size) {
+		os->mmap_off = os->id * mmap_size;
+		os->mmap_size = mmap_size;
+	}
 	os->ucnt = ucnt;
+	os->se = se;
 
 	memset(os->vol, -1, sizeof(os->vol));
 	memset(os->vol_set, -1, sizeof(os->vol));
@@ -1092,9 +1109,10 @@ static void set_extra_env(pid_t pid)
 	close(fd);
 }
 
-static int create_os(const char *slave_path, size_t stream_size,
+static int create_os(const char *slave_path,
+		     size_t stream_size, size_t mmap_size,
 		     pid_t pid, pid_t pgrp, uid_t uid, gid_t gid,
-		     struct ossp_stream **osp)
+		     struct fuse_session *se, struct ossp_stream **osp)
 {
 	static pthread_mutex_t create_mutex = PTHREAD_MUTEX_INITIALIZER;
 	int cmd_sock[2] = { -1, -1 };
@@ -1127,8 +1145,8 @@ static int create_os(const char *slave_path, size_t stream_size,
 	 * Alloc stream which will be responsible for all server side
 	 * resources from now on.
 	 */
-	rc = alloc_os(stream_size, pid, pgrp, uid, gid, cmd_sock[0],
-		      notify_sock, &os);
+	rc = alloc_os(stream_size, mmap_size, pid, pgrp, uid, gid, cmd_sock[0],
+		      notify_sock, se, &os);
 	if (rc) {
 		warn_e(rc, "failed to allocate stream for %d", pid);
 		goto close_all;
@@ -1172,16 +1190,24 @@ static int create_os(const char *slave_path, size_t stream_size,
 
 	if (os->slave_pid == 0) {
 		/* child */
-		char id_str[2][16], fd_str[2][16];
+		char id_str[2][16], fd_str[3][16];
+		char mmap_off_str[32], mmap_size_str[32];
 		char log_str[16], slave_path_copy[PATH_MAX];
 		char *argv[] = { slave_path_copy, "-u", id_str[0],
 				 "-g", id_str[1], "-c", fd_str[0],
-				 "-n", fd_str[1], "-l", log_str, NULL, NULL };
+				 "-n", fd_str[1], "-m", fd_str[2],
+				 "-o", mmap_off_str, "-s", mmap_size_str,
+				 "-l", log_str, NULL, NULL };
 		struct passwd *pwd;
 
 		/* drop stuff we don't need */
 		if (close(cmd_sock[0]) || close(notify_sock[0]))
 			fatal_e(-errno, "failed to close server pipe fds");
+
+#ifdef OSSP_MMAP
+		if (!mmap_size)
+#endif
+			close(fuse_mmap_fd(se));
 
 		clearenv();
 		pwd = getpwuid(os->uid);
@@ -1206,6 +1232,15 @@ static int create_os(const char *slave_path, size_t stream_size,
 		snprintf(id_str[1], sizeof(id_str[0]), "%d", os->gid);
 		snprintf(fd_str[0], sizeof(fd_str[0]), "%d", cmd_sock[1]);
 		snprintf(fd_str[1], sizeof(fd_str[1]), "%d", notify_sock[1]);
+		snprintf(fd_str[2], sizeof(fd_str[2]), "%d",
+#ifdef OSSP_MMAP
+			 mmap_size ? fuse_mmap_fd(se) :
+#endif
+			 -1);
+		snprintf(mmap_off_str, sizeof(mmap_off_str), "0x%llx",
+			 (unsigned long long)os->mmap_off);
+		snprintf(mmap_size_str, sizeof(mmap_size_str), "0x%zx",
+			 mmap_size);
 		snprintf(log_str, sizeof(log_str), "%d", ossp_log_level);
 		if (ossp_log_timestamp)
 			argv[ARRAY_SIZE(argv) - 2] = "-t";
@@ -1227,8 +1262,13 @@ static int create_os(const char *slave_path, size_t stream_size,
 	}
 
 	dbg0_os(os, "CREATE slave=%d %s", os->slave_pid, slave_path);
-	dbg0_os(os, "  client=%d cmd=%d:%d notify=%d:%d",
-		pid, cmd_sock[0], cmd_sock[1], notify_sock[0], notify_sock[1]);
+	dbg0_os(os, "  client=%d cmd=%d:%d notify=%d:%d mmap=%d:0x%llx:%zu",
+		pid, cmd_sock[0], cmd_sock[1], notify_sock[0], notify_sock[1],
+#ifdef OSSP_MMAP
+		os->mmap_size ? fuse_mmap_fd(se) :
+#endif
+		-1,
+		(unsigned long long)os->mmap_off, os->mmap_size);
 
 	*osp = os;
 	rc = 0;
@@ -1268,11 +1308,11 @@ static void dsp_open_common(fuse_req_t req, struct fuse_file_info *fi,
 		goto err;
 	}
 
-	ret = create_os(dsp_slave_path, sizeof(*dsps), fuse_ctx->pid, pgrp,
-			fuse_ctx->uid, fuse_ctx->gid, &os);
+	ret = create_os(dsp_slave_path, sizeof(*dsps), DSPS_MMAP_SIZE,
+			fuse_ctx->pid, pgrp, fuse_ctx->uid, fuse_ctx->gid,
+			se, &os);
 	if (ret)
 		goto err;
-	os->se = se;
 	dsps = os_to_dsps(os);
 	mixer = os->mixer;
 
@@ -1590,12 +1630,14 @@ static int dsp_mmap_dir(int prot)
 }
 
 static void dsp_mmap(fuse_req_t req, void *addr, size_t len, int prot,
-		     int flags, off_t offset, struct fuse_file_info *fi)
+		     int flags, off_t offset, struct fuse_file_info *fi,
+		     uint64_t mh)
 {
 	int dir = dsp_mmap_dir(prot);
-	int fd = -1;
+	struct ossp_dsp_mmap_arg arg = { };
 	struct ossp_stream *os;
 	struct ossp_dsp_stream *dsps;
+	ssize_t ret;
 
 	os = find_os(fi->fh);
 	if (!os) {
@@ -1604,62 +1646,35 @@ static void dsp_mmap(fuse_req_t req, void *addr, size_t len, int prot,
 	}
 	dsps = os_to_dsps(os);
 
-	if (dsps->nr_mmaps[dir])
-		fd = dsps->mmap_fd[dir];
-
-	fuse_reply_mmap(req, fd, FUSE_MMAP_DONT_COPY | FUSE_MMAP_DONT_EXPAND);
-}
-
-static void dsp_mmap_commit(fuse_req_t req, void *addr, size_t len, int prot,
-			    int flags, int fd, off_t offset,
-			    struct fuse_file_info *fi, uint64_t mmap_unique)
-{
-	int dir = dsp_mmap_dir(prot);
-	struct ossp_dsp_mmap_arg arg = { .dir = dir, .size = offset + len };
-	struct ossp_stream *os;
-	struct ossp_dsp_stream *dsps;
-	int rc;
-
-	rc = 0;
-	if (fd < 0)
-		goto out;
-
-	rc = -EOVERFLOW;
-	if (arg.size < offset)
-		goto out;
-
-	rc = -EBADF;
-	os = find_os(fi->fh);
-	if (!os)
-		goto out;
-	dsps = os_to_dsps(os);
+	if (!os->mmap_off || len > os->mmap_size / 2) {
+		fuse_reply_err(req, EINVAL);
+		return;
+	}
 
 	pthread_mutex_lock(&os->mmap_mutex);
 
-	if (dsps->nr_mmaps[dir]) {
-		rc = 0;
-		if (dsps->mmap_fd[dir] != fd)
-			rc = -EBUSY;
-		goto out_unlock;
-	}
-
-	rc = exec_cmd(os, OSSP_DSP_MMAP, &arg, sizeof(arg), NULL, 0, NULL, 0,
-		      NULL, NULL, fd);
-	if (rc)
+	ret = -EBUSY;
+	if (dsps->mmapped & (1 << dir))
 		goto out_unlock;
 
-	dsps->nr_mmaps[dir]++;
-	dsps->mmap_fd[dir] = fd;
-	dsps->mmapped = 1;
+	arg.dir = dir;
+	arg.size = len;
+
+	ret = exec_simple_cmd(os, OSSP_DSP_MMAP, &arg, NULL);
+	if (ret == 0)
+		dsps->mmapped |= 1 << dir;
 
 out_unlock:
 	pthread_mutex_unlock(&os->mmap_mutex);
-out:
-	fuse_reply_err(req, -rc);
+
+	if (ret == 0)
+		fuse_reply_mmap(req, os->mmap_off + dir * os->mmap_size / 2, 0);
+	else
+		fuse_reply_err(req, -ret);
 }
 
-static void dsp_munmap(fuse_req_t req, void *addr, size_t len,
-		       struct fuse_file_info *fi, uint64_t mmap_unique, int fd)
+static void dsp_munmap(fuse_req_t req, size_t len, struct fuse_file_info *fi,
+		       off_t offset, uint64_t mh)
 {
 	struct ossp_stream *os;
 	struct ossp_dsp_stream *dsps;
@@ -1673,21 +1688,20 @@ static void dsp_munmap(fuse_req_t req, void *addr, size_t len,
 	pthread_mutex_lock(&os->mmap_mutex);
 
 	for (dir = 0; dir < 2; dir++)
-		if (dsps->nr_mmaps[dir] && dsps->mmap_fd[dir] == fd)
+		if (offset == os->mmap_off + dir * os->mmap_size / 2)
 			break;
-	if (dir == 2) {
-		warn_os(os, "invalid munmap request for fd %d (%d:%d %d:%d)",
-			fd, dsps->nr_mmaps[PLAY], dsps->mmap_fd[PLAY],
-			dsps->nr_mmaps[REC], dsps->mmap_fd[REC]);
+	if (dir == 2 || len > os->mmap_size / 2) {
+		warn_os(os, "invalid munmap request "
+			"offset=%llu len=%zu mmapped=0x%x",
+			(unsigned long long)offset, len, dsps->mmapped);
 		goto out_unlock;
 	}
 
-	if (--dsps->nr_mmaps[dir])
-		goto out_unlock;
-
 	rc = exec_simple_cmd(os, OSSP_DSP_MUNMAP, &dir, NULL);
 	if (rc)
-		warn_ose(os, rc, "MUNMAP failed for dir=%d fd=%d", dir, fd);
+		warn_ose(os, rc, "MUNMAP failed for dir=%d", dir);
+
+	dsps->mmapped &= ~(1 << dir);
 
 out_unlock:
 	pthread_mutex_unlock(&os->mmap_mutex);
@@ -1928,7 +1942,6 @@ static const struct cuse_lowlevel_ops dsp_ops = {
 	.ioctl			= dsp_ioctl,
 #ifdef OSSP_MMAP
 	.mmap			= dsp_mmap,
-	.mmap_commit		= dsp_mmap_commit,
 	.munmap			= dsp_munmap,
 #endif
 };
@@ -1942,7 +1955,6 @@ static const struct cuse_lowlevel_ops adsp_ops = {
 	.ioctl			= dsp_ioctl,
 #ifdef OSSP_MMAP
 	.mmap			= dsp_mmap,
-	.mmap_commit		= dsp_mmap_commit,
 	.munmap			= dsp_munmap,
 #endif
 };
@@ -2037,7 +2049,7 @@ static struct fuse_session *setup_ossp_cuse(const struct cuse_lowlevel_ops *ops,
 	}
 
 	fd = fuse_chan_fd(fuse_session_next_chan(se, NULL));
-	if (fcntl(fd, F_SETFD, FD_CLOEXEC) < 0) {
+	if (fd != fuse_mmap_fd(se) && fcntl(fd, F_SETFD, FD_CLOEXEC) < 0) {
 		err_e(-errno, "failed to set CLOEXEC on %s CUSE fd", name);
 		cuse_lowlevel_teardown(se);
 		return NULL;

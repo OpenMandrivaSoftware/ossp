@@ -17,7 +17,7 @@ const struct ossp_arg_size ossp_arg_sizes[OSSP_NR_OPCODES] = {
 	[OSSP_DSP_READ]		= { sizeof(struct ossp_dsp_rw_arg), 0, 0 },
 	[OSSP_DSP_WRITE]	= { sizeof(struct ossp_dsp_rw_arg), 0, 0 },
 	[OSSP_DSP_POLL]		= { sizeof(int), sizeof(unsigned), 0 },
-	[OSSP_DSP_MMAP]		= { sizeof(struct ossp_dsp_mmap_arg), 0, 1 },
+	[OSSP_DSP_MMAP]		= { sizeof(struct ossp_dsp_mmap_arg), 0, 0 },
 	[OSSP_DSP_MUNMAP]	= { sizeof(int), 0, 0 },
 
 	[OSSP_DSP_RESET]	= { 0, 0, 0 },
