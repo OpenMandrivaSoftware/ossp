@@ -57,8 +57,8 @@ enum {
 	DFL_DSP_MINOR		= 3,
 	DFL_ADSP_MAJOR		= 14,
 	DFL_ADSP_MINOR		= 12,
-	DFL_MAX_STREAMS		= 256,
-	MIXER_PUT_DELAY		= 600,	/* 10 mins */
+	DFL_MAX_STREAMS		= 128,
+	MIXER_PUT_DELAY		= 600,			/* 10 mins */
 };
 
 struct ossp_uid_cnt {
