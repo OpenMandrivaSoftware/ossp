@@ -35,6 +35,11 @@ extern char ossp_log_name[OSSP_LOG_NAME_LEN];
 extern int ossp_log_level;
 extern int ossp_log_timestamp;
 
+#define BITS_PER_BYTE		8
+#define BITS_PER_LONG		(BITS_PER_BYTE * sizeof(long))
+#define DIV_ROUND_UP(n,d)	(((n) + (d) - 1) / (d))
+#define BITS_TO_LONGS(nr)	DIV_ROUND_UP(nr, BITS_PER_BYTE * sizeof(long))
+
 /* ARRAY_SIZE and min/max macros stolen from linux/kernel.h */
 #define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]))
 
@@ -136,6 +141,15 @@ int ensure_sbuf_size(struct sized_buf *sbuf, size_t size);
 
 int read_fill(int fd, void *buf, size_t size);
 int write_fill(int fd, const void *buf, size_t size);
+
+/*
+ * Bitops lifted from linux asm-generic implementation.
+ */
+unsigned long find_next_zero_bit(const unsigned long *addr, unsigned
+				 long size, unsigned long offset);
+#define find_first_zero_bit(addr, size) find_next_zero_bit((addr), (size), 0)
+extern void __set_bit(int nr, volatile unsigned long *addr);
+extern void __clear_bit(int nr, volatile unsigned long *addr);
 
 typedef ssize_t (*ossp_action_fn_t)(enum ossp_opcode opcode,
 				    void *carg, void *din, size_t din_sz,

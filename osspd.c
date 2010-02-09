@@ -28,6 +28,7 @@
 #include <sys/socket.h>
 #include <sys/soundcard.h>
 #include <sys/time.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "ossp.h"
@@ -36,7 +37,7 @@
 #define DFL_MIXER_NAME		"mixer"
 #define DFL_DSP_NAME		"dsp"
 #define DFL_ADSP_NAME		"adsp"
-#define STRFMT			"S[%"PRIu64"/%d]"
+#define STRFMT			"S[%u/%d]"
 #define STRID(os)		os->id, os->pid
 
 #define dbg1_os(os, fmt, args...)	dbg1(STRFMT" "fmt, STRID(os) , ##args)
@@ -88,7 +89,7 @@ struct ossp_mixer_cmd {
 	for (i = 0, j = 0; i < 2; j += i << 1, j++, i = j >> 1, j &= 1)
 
 struct ossp_stream {
-	uint64_t		id;	/* stream ID, also CUSE file handle */
+	unsigned		id;	/* stream ID */
 	struct list_head	link;
 	struct list_head	pgrp_link;
 	struct list_head	notify_link;
@@ -141,8 +142,8 @@ static char dsp_slave_path[PATH_MAX];
 
 static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t mixer_mutex = PTHREAD_MUTEX_INITIALIZER;
-static uint64_t os_id;
-static unsigned nr_os, nr_mixers;
+static unsigned long *os_id_bitmap;
+static unsigned nr_mixers;
 static struct list_head *mixer_tbl;	/* indexed by PGRP */
 static struct list_head *os_tbl;	/* indexed by ID */
 static struct list_head *os_pgrp_tbl;	/* indexed by PGRP */
@@ -150,10 +151,13 @@ static struct list_head *os_notify_tbl;	/* indexed by notify fd */
 static LIST_HEAD(uid_cnt_list);
 static int notify_epfd;			/* epoll used to monitor notify fds */
 static pthread_t notify_poller_thread;
+static pthread_t slave_reaper_thread;
 static pthread_t mixer_delayed_put_thread;
 static pthread_t cuse_mixer_thread;
 static pthread_t cuse_adsp_thread;
 static pthread_cond_t notify_poller_kill_wait = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t slave_reaper_wait = PTHREAD_COND_INITIALIZER;
+static LIST_HEAD(slave_corpse_list);
 static LIST_HEAD(mixer_delayed_put_head); /* delayed reference */
 static pthread_cond_t mixer_delayed_put_cond = PTHREAD_COND_INITIALIZER;
 
@@ -210,7 +214,7 @@ static struct ossp_mixer *find_mixer(pid_t pgrp)
 	return mixer;
 }
 
-static struct ossp_stream *find_os(uint64_t id)
+static struct ossp_stream *find_os(unsigned id)
 {
 	struct ossp_stream *os, *found = NULL;
 
@@ -913,10 +917,6 @@ static int alloc_os(size_t stream_size, pid_t pid, uid_t pgrp,
 
 	pthread_mutex_lock(&mutex);
 
-	rc = -EBUSY;
-	if (nr_os + 1 > max_streams)
-		goto err_unlock;
-
 	list_for_each_entry(tmp_ucnt, &uid_cnt_list, link)
 		if (tmp_ucnt->uid == uid) {
 			ucnt = tmp_ucnt;
@@ -935,7 +935,13 @@ static int alloc_os(size_t stream_size, pid_t pid, uid_t pgrp,
 	if (ucnt->nr_os + 1 > umax_streams)
 		goto err_unlock;
 
-	os->id = ++os_id;
+	/* everything looks fine, allocate id and init stream */
+	rc = -EBUSY;
+	os->id = find_next_zero_bit(os_id_bitmap, max_streams, 0);
+	if (os->id >= max_streams)
+		goto err_unlock;
+	__set_bit(os->id, os_id_bitmap);
+
 	os->cmd_fd = cmd_sock;
 	os->notify_tx = notify[1];
 	os->notify_rx = notify[0];
@@ -951,7 +957,6 @@ static int alloc_os(size_t stream_size, pid_t pid, uid_t pgrp,
 	list_add(&os->link, os_tbl_head(os->id));
 	list_add(&os->pgrp_link, os_pgrp_tbl_head(os->pgrp));
 
-	nr_os++;
 	ucnt->nr_os++;
 	*osp = os;
 	pthread_mutex_unlock(&mutex);
@@ -1018,7 +1023,6 @@ static void put_os(struct ossp_stream *os)
 	list_del_init(&os->link);
 	list_del_init(&os->pgrp_link);
 	list_del_init(&os->notify_link);
-	nr_os--;
 	os->ucnt->nr_os--;
 
 	pthread_mutex_unlock(&mutex);
@@ -1028,7 +1032,12 @@ static void put_os(struct ossp_stream *os)
 	put_mixer(os->mixer);
 	pthread_mutex_destroy(&os->cmd_mutex);
 	pthread_mutex_destroy(&os->mmap_mutex);
-	free(os);
+
+	pthread_mutex_lock(&mutex);
+	dbg1_os(os, "stream dead, requesting reaping");
+	list_add_tail(&os->link, &slave_corpse_list);
+	pthread_cond_signal(&slave_reaper_wait);
+	pthread_mutex_unlock(&mutex);
 }
 
 static void set_extra_env(pid_t pid)
@@ -1791,6 +1800,48 @@ repeat:
 
 
 /***************************************************************************
+ * Slave corpse reaper
+ */
+
+static void *slave_reaper(void *arg)
+{
+	struct ossp_stream *os;
+	int status;
+	pid_t pid;
+
+	pthread_mutex_lock(&mutex);
+repeat:
+	while (list_empty(&slave_corpse_list))
+		pthread_cond_wait(&slave_reaper_wait, &mutex);
+
+	os = list_first_entry(&slave_corpse_list, struct ossp_stream, link);
+	list_del_init(&os->link);
+
+	pthread_mutex_unlock(&mutex);
+
+	do {
+		pid = waitpid(os->slave_pid, &status, 0);
+	} while (pid < 0 && errno == EINTR);
+
+	if (pid < 0) {
+		if (errno == ECHILD)
+			warn_ose(os, -errno, "slave %d already gone?",
+				 os->slave_pid);
+		else
+			fatal_e(-errno, "waitpid(%d) failed", os->slave_pid);
+	}
+
+	pthread_mutex_lock(&mutex);
+
+	dbg1_os(os, "slave %d reaped", os->slave_pid);
+	__clear_bit(os->id, os_id_bitmap);
+	free(os);
+
+	goto repeat;
+}
+
+
+/***************************************************************************
  * Stuff to bind and start everything
  */
 
@@ -2073,13 +2124,7 @@ int main(int argc, char **argv)
 	info("OSS Proxy v%s (C) 2008-2009 by Tejun Heo <teheo@suse.de>",
 	     OSSP_VERSION);
 
-	/* we don't care about zombies and don't want stupid SIGPIPEs */
-	memset(&sa, 0, sizeof(sa));
-	sa.sa_handler = SIG_IGN;
-	sa.sa_flags = SA_NOCLDSTOP | SA_NOCLDWAIT;
-	if (sigaction(SIGCHLD, &sa, NULL))
-		fatal_e(-errno, "failed to ignore SIGCHLD");
-
+	/* ignore stupid SIGPIPEs */
 	memset(&sa, 0, sizeof(sa));
 	sa.sa_handler = SIG_IGN;
 	if (sigaction(SIGPIPE, &sa, NULL))
@@ -2108,11 +2153,13 @@ int main(int argc, char **argv)
 		fatal("%s is not executable", dsp_slave_path);
 
 	/* allocate tables */
+	os_id_bitmap = calloc(BITS_TO_LONGS(max_streams), sizeof(long));
 	mixer_tbl = calloc(hashtbl_size, sizeof(mixer_tbl[0]));
 	os_tbl = calloc(hashtbl_size, sizeof(os_tbl[0]));
 	os_pgrp_tbl = calloc(hashtbl_size, sizeof(os_pgrp_tbl[0]));
 	os_notify_tbl = calloc(hashtbl_size, sizeof(os_notify_tbl[0]));
-	if (!mixer_tbl || !os_tbl || !os_pgrp_tbl || !os_notify_tbl)
+	if (!os_id_bitmap || !mixer_tbl || !os_tbl || !os_pgrp_tbl ||
+	    !os_notify_tbl)
 		fatal("failed to allocate stream hash tables");
 	for (u = 0; u < hashtbl_size; u++) {
 		INIT_LIST_HEAD(&mixer_tbl[u]);
@@ -2120,6 +2167,7 @@ int main(int argc, char **argv)
 		INIT_LIST_HEAD(&os_pgrp_tbl[u]);
 		INIT_LIST_HEAD(&os_notify_tbl[u]);
 	}
+	__set_bit(0, os_id_bitmap);	/* don't use id 0 */
 
 	/* create mixer delayed reference worker */
 	ret = -pthread_create(&mixer_delayed_put_thread, NULL,
@@ -2148,6 +2196,11 @@ int main(int argc, char **argv)
 	ret = -pthread_create(&notify_poller_thread, NULL, notify_poller, NULL);
 	if (ret)
 		fatal_e(ret, "failed to create notify poller thread");
+
+	/* create reaper for slave corpses */
+	ret = -pthread_create(&slave_reaper_thread, NULL, slave_reaper, NULL);
+	if (ret)
+		fatal_e(ret, "failed to create slave reaper thread");
 
 	/* we're set, let's setup fuse structures */
 	if (strlen(param.mixer_name))
