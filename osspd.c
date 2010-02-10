@@ -1206,8 +1206,8 @@ static int create_os(const char *slave_path,
 
 #ifdef OSSP_MMAP
 		if (!mmap_size)
-#endif
 			close(fuse_mmap_fd(se));
+#endif
 
 		clearenv();
 		pwd = getpwuid(os->uid);
@@ -2049,7 +2049,11 @@ static struct fuse_session *setup_ossp_cuse(const struct cuse_lowlevel_ops *ops,
 	}
 
 	fd = fuse_chan_fd(fuse_session_next_chan(se, NULL));
-	if (fd != fuse_mmap_fd(se) && fcntl(fd, F_SETFD, FD_CLOEXEC) < 0) {
+	if (
+#ifdef OSSP_MMAP
+		fd != fuse_mmap_fd(se) &&
+#endif
+		fcntl(fd, F_SETFD, FD_CLOEXEC) < 0) {
 		err_e(-errno, "failed to set CLOEXEC on %s CUSE fd", name);
 		cuse_lowlevel_teardown(se);
 		return NULL;
