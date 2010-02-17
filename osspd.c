@@ -140,6 +140,7 @@ struct ossp_stream {
 
 struct ossp_dsp_stream {
 	struct ossp_stream	os;
+	unsigned		rw;
 	unsigned		mmapped;
 	int			nonblock;
 };
@@ -1316,6 +1317,20 @@ static void dsp_open_common(fuse_req_t req, struct fuse_file_info *fi,
 	dsps = os_to_dsps(os);
 	mixer = os->mixer;
 
+	switch (fi->flags & O_ACCMODE) {
+	case O_WRONLY:
+		dsps->rw |= 1 << PLAY;
+		break;
+	case O_RDONLY:
+		dsps->rw |= 1 << REC;
+		break;
+	case O_RDWR:
+		dsps->rw |= (1 << PLAY) | (1 << REC);
+		break;
+	default:
+		assert(0);
+	}
+
 	arg.flags = fi->flags;
 	arg.opener_pid = os->pid;
 	ret = exec_simple_cmd(&dsps->os, OSSP_DSP_OPEN, &arg, NULL);
@@ -1380,6 +1395,10 @@ static void dsp_read(fuse_req_t req, size_t size, off_t off,
 		goto out;
 	dsps = os_to_dsps(os);
 
+	ret = -EINVAL;
+	if (!(dsps->rw & (1 << REC)))
+		goto out;
+
 	ret = -ENXIO;
 	if (dsps->mmapped)
 		goto out;
@@ -1415,6 +1434,10 @@ static void dsp_write(fuse_req_t req, const char *buf, size_t size, off_t off,
 	if (!os)
 		goto out;
 	dsps = os_to_dsps(os);
+
+	ret = -EINVAL;
+	if (!(dsps->rw & (1 << PLAY)))
+		goto out;
 
 	ret = -ENXIO;
 	if (dsps->mmapped)
@@ -1568,8 +1591,17 @@ static void dsp_ioctl(fuse_req_t req, int signed_cmd, void *uarg,
 	case SNDCTL_DSP_GETISPACE: {
 		struct audio_buf_info info;
 
-		op = cmd == SNDCTL_DSP_GETOSPACE ? OSSP_DSP_GET_OSPACE
-						 : OSSP_DSP_GET_ISPACE;
+		ret = -EINVAL;
+		if (cmd == SNDCTL_DSP_GETOSPACE) {
+			if (!(dsps->rw & (1 << PLAY)))
+				goto err;
+			op = OSSP_DSP_GET_OSPACE;
+		} else {
+			if (!(dsps->rw & (1 << REC)))
+				goto err;
+			op = OSSP_DSP_GET_ISPACE;
+		}
+
 		PREP_UARG(NULL, &info);
 		ret = exec_simple_cmd(&dsps->os, op, NULL, &info);
 		if (ret)
