@@ -1380,7 +1380,7 @@ static void dsp_read(fuse_req_t req, size_t size, off_t off,
 		goto out;
 	dsps = os_to_dsps(os);
 
-	ret = -EIO;
+	ret = -ENXIO;
 	if (dsps->mmapped)
 		goto out;
 
@@ -1416,7 +1416,7 @@ static void dsp_write(fuse_req_t req, const char *buf, size_t size, off_t off,
 		goto out;
 	dsps = os_to_dsps(os);
 
-	ret = -EIO;
+	ret = -ENXIO;
 	if (dsps->mmapped)
 		goto out;
 
