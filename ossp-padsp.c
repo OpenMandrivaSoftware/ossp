@@ -1136,9 +1136,11 @@ static ssize_t padsp_poll(enum ossp_opcode opcode,
 
 	stream_notify |= *(int *)carg;
 
-	if (stream[PLAY] && pa_stream_writable_size(stream[PLAY]))
+	if (stream[PLAY] &&
+	    pa_stream_writable_size(stream[PLAY]) >= user_frag_size)
 		revents |= POLLOUT;
-	if (stream[REC] && pa_stream_readable_size(stream[REC]))
+	if (stream[REC] &&
+	    pa_stream_readable_size(stream[REC]) >= user_frag_size)
 		revents |= POLLIN;
 
 	*(unsigned *)rarg = revents;
