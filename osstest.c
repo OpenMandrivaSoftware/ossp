@@ -15,6 +15,9 @@
 #include <unistd.h>
 #include <errno.h>
 #include <string.h>
+#include <poll.h>
+#include <sys/mman.h>
+#include <stdlib.h>
 
 #define MIXERDEV "/dev/mixer"
 #define DSPDEV "/dev/dsp"
@@ -36,10 +39,14 @@ static int report_success = 1;
 
 static int mixerfd, dspfd;
 
-static int reopen(void)
+static int reopen(int blocking)
 {
 	close(dspfd);
-	dspfd = open(DSPDEV, O_RDWR);
+	if (!blocking)
+		blocking = O_NDELAY;
+	else
+		blocking = 0;
+	dspfd = open(DSPDEV, O_RDWR|blocking);
 	return dspfd;
 }
 
@@ -181,17 +188,75 @@ static void test_trigger(int fd)
 	ok(ret == 0, "Returned error %s", strerror(errno));
 }
 
+static void test_mmap(int fd)
+{
+	char *area;
+	int ret;
+	char buf[24];
+
+	area = mmap(NULL, 8192, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+	ok(area != MAP_FAILED, "Failed to map: %s\n", strerror(errno));
+
+	if (area == MAP_FAILED)
+		return;
+
+	ret = write(fd, &buf, sizeof(buf));
+	ok(ret == -1, "write after mmap returned %i\n", ret);
+	if (ret == -1)
+		ok(errno == ENXIO, "Error returned is %s\n", strerror(errno));
+
+	munmap(area, 8192);
+}
+
+static void test_notify(int fd)
+{
+	struct audio_buf_info bi;
+	char *bytes = NULL;
+	int ret, written;
+	struct pollfd pfd = { fd, POLLOUT };
+	int rounds = 20;
+
+	ioctl(fd, SNDCTL_DSP_GETOSPACE, &bi);
+
+	bytes = calloc(1, bi.fragsize);
+	written = 0;
+	ok(0, "Fragsize: %i, bytes: %i\n", bi.fragsize, bi.bytes);
+	while (written + bi.fragsize - 1 < bi.bytes)
+	{
+		ret = write(fd, bytes, bi.fragsize);
+		ok(ret == bi.fragsize, "Returned: %i instead of %i\n",
+		   ret, bi.fragsize);
+		if (ret > 0)
+			written += ret;
+	};
+
+	while (rounds--)
+	{
+		ret = poll(&pfd, 1, -1);
+		ok(ret > 0, "Poll returned %i\n", ret);
+		if (ret < 0)
+			break;
+		ret = write(fd, bytes, bi.fragsize);
+		if (ret < 0) ret = -errno;
+		ok(ret == bi.fragsize, "Returned: %i instead of %i\n",
+		   ret, bi.fragsize);
+	}
+}
+
 int main()
 {
 	test_open();
 	if (mixerfd >= 0)
 		test_mixer();
 
-	if (reopen() >= 0)
+	if (reopen(1) >= 0)
 		test_trigger(dspfd);
 
-	if (reopen() >= 0)
-		;//test_(dspfd);
+	if (reopen(0) >= 0)
+		test_notify(dspfd);
+
+	if (reopen(1) >= 0)
+		test_mmap(dspfd);
 
 	close(mixerfd);
 	close(dspfd);
