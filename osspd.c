@@ -35,14 +35,11 @@
 #include "ossp-util.h"
 
 /*
- * If FUSE_MMAP_DONT_COPY is defined, we're building against libfuse
- * w/ direct mmap support.  Define OSSP_MMAP.
+ * MMAP support needs to be updated to the new fuse MMAP API.  Disable
+ * it for the time being.
  */
-#ifdef FUSE_MMAP_DONT_COPY
-#define OSSP_MMAP
-#else
-#warning libfuse is missing direct mmap support, disabling mmap
-#endif
+#warning mmap support disabled for now
+/* #define OSSP_MMAP */
 
 #define DFL_MIXER_NAME		"mixer"
 #define DFL_DSP_NAME		"dsp"
