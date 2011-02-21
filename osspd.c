@@ -2253,7 +2253,7 @@ int main(int argc, char **argv)
 					   param.mixer_major, param.mixer_minor,
 					   args.argc, args.argv);
 	if (strlen(param.adsp_name))
-		adsp_se = setup_ossp_cuse(&dsp_ops, param.adsp_name,
+		adsp_se = setup_ossp_cuse(&adsp_ops, param.adsp_name,
 					  param.adsp_major, param.adsp_minor,
 					  args.argc, args.argv);
 
