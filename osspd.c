@@ -469,15 +469,6 @@ static int ioctl_prep_uarg(fuse_req_t req, void *in, size_t in_sz, void *out,
 		return;							\
 } while (0)
 
-#define IOCTL_RETURN(result, outp) do {					\
-	if ((outp) != NULL)						\
-		fuse_reply_ioctl(req, result, (outp), sizeof(*(outp)));	\
-	else								\
-		fuse_reply_ioctl(req, result, NULL, 0);			\
-	return;								\
-} while (0)
-
-
 /***************************************************************************
  * Mixer implementation
  */
@@ -709,7 +700,8 @@ static void mixer_simple_ioctl(fuse_req_t req, struct ossp_mixer *mixer,
 		strncpy(info.id, id, sizeof(info.id) - 1);
 		strncpy(info.name, name, sizeof(info.name) - 1);
 		info.modify_counter = mixer->modify_counter;
-		IOCTL_RETURN(0, &info);
+		fuse_reply_ioctl(req, 0, &info, sizeof(info));
+		break;
 	}
 
 	case SOUND_OLD_MIXER_INFO: {
@@ -718,7 +710,8 @@ static void mixer_simple_ioctl(fuse_req_t req, struct ossp_mixer *mixer,
 		PREP_UARG(NULL, &info);
 		strncpy(info.id, id, sizeof(info.id) - 1);
 		strncpy(info.name, name, sizeof(info.name) - 1);
-		IOCTL_RETURN(0, &info);
+		fuse_reply_ioctl(req, 0, &info, sizeof(info));
+		break;
 	}
 
 	case OSS_GETVERSION:
@@ -737,16 +730,16 @@ static void mixer_simple_ioctl(fuse_req_t req, struct ossp_mixer *mixer,
 		goto puti;
 	puti:
 		PREP_UARG(NULL, &i);
-		IOCTL_RETURN(0, &i);
+		fuse_reply_ioctl(req, 0, &i, sizeof(i));
+		break;
 
 	case SOUND_MIXER_WRITE_RECSRC:
-		IOCTL_RETURN(0, NULL);
+		fuse_reply_ioctl(req, 0, NULL, 0);
+		break;
 
 	default:
 		*not_minep = 1;
-		return;
 	}
-	assert(0);
 }
 
 static void mixer_do_ioctl(fuse_req_t req, struct ossp_mixer *mixer,
@@ -787,7 +780,8 @@ static void mixer_do_ioctl(fuse_req_t req, struct ossp_mixer *mixer,
 		break;
 	default:
 		i = 0;
-		IOCTL_RETURN(0, &i);
+		fuse_reply_ioctl(req, 0, &i, sizeof(i));
+		return;
 	}
 
 	init_mixer_cmd(&mxcmd, mixer);
@@ -837,7 +831,12 @@ static void mixer_do_ioctl(fuse_req_t req, struct ossp_mixer *mixer,
 	finish_mixer_cmd(&mxcmd);
 	free(osa);
 
-	IOCTL_RETURN(0, out_bufsz ? &mxcmd.rvol : NULL);
+	if (out_bufsz)
+		fuse_reply_ioctl(req, 0, &mxcmd.rvol, sizeof(mxcmd.rvol));
+	else
+		fuse_reply_ioctl(req, 0, NULL, 0);
+
+	return;
 
 err:
 	fuse_reply_err(req, -rc);
@@ -1510,7 +1509,8 @@ static void dsp_ioctl(fuse_req_t req, int signed_cmd, void *uarg,
 	case OSS_GETVERSION:
 		i = SNDRV_OSS_VERSION;
 		PREP_UARG(NULL, &i);
-		IOCTL_RETURN(0, &i);
+		fuse_reply_ioctl(req, 0, &i, sizeof(i));
+		break;
 
 	case SNDCTL_DSP_GETCAPS:
 		i = DSP_CAP_DUPLEX | DSP_CAP_REALTIME | DSP_CAP_TRIGGER |
@@ -1519,12 +1519,14 @@ static void dsp_ioctl(fuse_req_t req, int signed_cmd, void *uarg,
 #endif
 			DSP_CAP_MULTI;
 		PREP_UARG(NULL, &i);
-		IOCTL_RETURN(0, &i);
+		fuse_reply_ioctl(req, 0, &i, sizeof(i));
+		break;
 
 	case SNDCTL_DSP_NONBLOCK:
 		dsps->nonblock = 1;
 		ret = 0;
-		IOCTL_RETURN(0, NULL);
+		fuse_reply_ioctl(req, 0, NULL, 0);
+		break;
 
 	case SNDCTL_DSP_RESET:		op = OSSP_DSP_RESET;		goto nd;
 	case SNDCTL_DSP_SYNC:		op = OSSP_DSP_SYNC;		goto nd;
@@ -1533,7 +1535,8 @@ static void dsp_ioctl(fuse_req_t req, int signed_cmd, void *uarg,
 		ret = exec_simple_cmd(&dsps->os, op, NULL, NULL);
 		if (ret)
 			goto err;
-		IOCTL_RETURN(0, NULL);
+		fuse_reply_ioctl(req, 0, NULL, 0);
+		break;
 
 	case SOUND_PCM_READ_RATE:	op = OSSP_DSP_GET_RATE;		goto ri;
 	case SOUND_PCM_READ_BITS:	op = OSSP_DSP_GET_FORMAT;	goto ri;
@@ -1546,7 +1549,8 @@ static void dsp_ioctl(fuse_req_t req, int signed_cmd, void *uarg,
 		ret = exec_simple_cmd(&dsps->os, op, NULL, &i);
 		if (ret)
 			goto err;
-		IOCTL_RETURN(0, &i);
+		fuse_reply_ioctl(req, 0, &i, sizeof(i));
+		break;
 
 	case SNDCTL_DSP_SPEED:		op = OSSP_DSP_SET_RATE;		goto wi;
 	case SNDCTL_DSP_SETFMT:		op = OSSP_DSP_SET_FORMAT;	goto wi;
@@ -1557,7 +1561,8 @@ static void dsp_ioctl(fuse_req_t req, int signed_cmd, void *uarg,
 		ret = exec_simple_cmd(&dsps->os, op, &i, &i);
 		if (ret)
 			goto err;
-		IOCTL_RETURN(0, &i);
+		fuse_reply_ioctl(req, 0, &i, sizeof(i));
+		break;
 
 	case SNDCTL_DSP_STEREO:
 		PREP_UARG(NULL, &i);
@@ -1566,7 +1571,8 @@ static void dsp_ioctl(fuse_req_t req, int signed_cmd, void *uarg,
 		i--;
 		if (ret)
 			goto err;
-		IOCTL_RETURN(0, &i);
+		fuse_reply_ioctl(req, 0, &i, sizeof(i));
+		break;
 
 	case SNDCTL_DSP_SETFRAGMENT:
 		PREP_UARG(&i, NULL);
@@ -1574,7 +1580,8 @@ static void dsp_ioctl(fuse_req_t req, int signed_cmd, void *uarg,
 				      OSSP_DSP_SET_FRAGMENT, &i, NULL);
 		if (ret)
 			goto err;
-		IOCTL_RETURN(0, NULL);
+		fuse_reply_ioctl(req, 0, NULL, 0);
+		break;
 
 	case SNDCTL_DSP_SETTRIGGER:
 		PREP_UARG(&i, NULL);
@@ -1582,7 +1589,8 @@ static void dsp_ioctl(fuse_req_t req, int signed_cmd, void *uarg,
 				      OSSP_DSP_SET_TRIGGER, &i, NULL);
 		if (ret)
 			goto err;
-		IOCTL_RETURN(0, NULL);
+		fuse_reply_ioctl(req, 0, NULL, 0);
+		break;
 
 	case SNDCTL_DSP_GETOSPACE:
 	case SNDCTL_DSP_GETISPACE: {
@@ -1603,7 +1611,8 @@ static void dsp_ioctl(fuse_req_t req, int signed_cmd, void *uarg,
 		ret = exec_simple_cmd(&dsps->os, op, NULL, &info);
 		if (ret)
 			goto err;
-		IOCTL_RETURN(0, &info);
+		fuse_reply_ioctl(req, 0, &info, sizeof(info));
+		break;
 	}
 
 	case SNDCTL_DSP_GETOPTR:
@@ -1616,14 +1625,16 @@ static void dsp_ioctl(fuse_req_t req, int signed_cmd, void *uarg,
 		ret = exec_simple_cmd(&dsps->os, op, NULL, &info);
 		if (ret)
 			goto err;
-		IOCTL_RETURN(0, &info);
+		fuse_reply_ioctl(req, 0, &info, sizeof(info));
+		break;
 	}
 
 	case SNDCTL_DSP_GETODELAY:
 		PREP_UARG(NULL, &i);
 		i = 0;
 		ret = exec_simple_cmd(&dsps->os, OSSP_DSP_GET_ODELAY, NULL, &i);
-		IOCTL_RETURN(ret, &i);	/* always copy out result, 0 on err */
+		fuse_reply_ioctl(req, ret, &i, sizeof(i));	/* always copy out result, 0 on err */
+		break;
 
 	case SOUND_PCM_WRITE_FILTER:
 	case SOUND_PCM_READ_FILTER:
@@ -1638,14 +1649,16 @@ static void dsp_ioctl(fuse_req_t req, int signed_cmd, void *uarg,
 	case SNDCTL_DSP_SETSYNCRO:
 	case SNDCTL_DSP_SETDUPLEX:
 	case SNDCTL_DSP_PROFILE:
-		IOCTL_RETURN(0, NULL);
+		fuse_reply_ioctl(req, 0, NULL, 0);
+		break;
 
 	default:
 		warn_os(os, "unknown ioctl 0x%x", cmd);
 		ret = -EINVAL;
 		goto err;
 	}
-	assert(0);	/* control shouldn't reach here */
+	return;
+
 err:
 	fuse_reply_err(req, -ret);
 }

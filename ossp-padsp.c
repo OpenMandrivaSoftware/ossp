@@ -972,16 +972,13 @@ static void do_mmap_read(size_t bytes)
 
 static void stream_rw_callback(pa_stream *s, size_t length, void *userdata)
 {
-	int dir;
 	size_t size;
 
 	if (s == stream[PLAY]) {
-		dir = PLAY;
 		size = pa_stream_writable_size(s);
 		if (mmap_map[PLAY])
 			do_mmap_write(size);
 	} else if (s == stream[REC]) {
-		dir = REC;
 		size = pa_stream_readable_size(s);
 		if (mmap_map[REC])
 			do_mmap_read(size);
