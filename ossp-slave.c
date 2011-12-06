@@ -32,7 +32,6 @@ static const char *usage =
 "    -c CMD_FD         fd to receive commands from osspd\n"
 "    -n NOTIFY_FD      fd to send async notifications to osspd\n"
 "    -m MMAP_FD        fd to use for mmap\n"
-"    -o MMAP_OFFSET    mmap offset\n"
 "    -s MMAP_SIZE      mmap size\n"
 "    -l LOG_LEVEL      set log level\n"
 "    -t                enable log timestamps\n";
@@ -40,6 +39,7 @@ static const char *usage =
 char ossp_user_name[OSSP_USER_NAME_LEN];
 int ossp_cmd_fd = -1, ossp_notify_fd = -1;
 void *ossp_mmap_addr[2];
+struct ossp_transfer *ossp_mmap_transfer;
 
 void ossp_slave_init(int argc, char **argv)
 {
@@ -47,7 +47,6 @@ void ossp_slave_init(int argc, char **argv)
 	uid_t uid;
 	gid_t gid;
 	int mmap_fd = -1;
-	off_t mmap_off = 0;
 	size_t mmap_size = 0;
 	int opt;
 	struct passwd *pw, pw_buf;
@@ -72,9 +71,6 @@ void ossp_slave_init(int argc, char **argv)
 			break;
 		case 'm':
 			mmap_fd = strtol(optarg, NULL, 0);
-			break;
-		case 'o':
-			mmap_off = strtoull(optarg, NULL, 0);
 			break;
 		case 's':
 			mmap_size = strtoul(optarg, NULL, 0);
@@ -104,18 +100,19 @@ void ossp_slave_init(int argc, char **argv)
 	if (mmap_fd >= 0) {
 		void *p;
 
-		if (!mmap_off || !mmap_size) {
+		if (!mmap_size) {
 			fprintf(stderr, usage);
 			_exit(1);
 		}
 
-		p = mmap(NULL, mmap_size, PROT_READ | PROT_WRITE, MAP_SHARED,
-			 mmap_fd, mmap_off);
+		p = mmap(NULL, mmap_size + 2 * sizeof(struct ossp_transfer),
+			 PROT_READ | PROT_WRITE, MAP_SHARED, mmap_fd, 0);
 		if (p == MAP_FAILED)
 			fatal_e(-errno, "mmap failed");
 
 		ossp_mmap_addr[PLAY] = p;
 		ossp_mmap_addr[REC] = p + mmap_size / 2;
+		ossp_mmap_transfer = p + mmap_size;
 		close(mmap_fd);
 	}
 

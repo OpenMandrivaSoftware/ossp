@@ -12,6 +12,7 @@
 
 #include <sys/types.h>
 #include <inttypes.h>
+#include <semaphore.h>
 #include <sys/soundcard.h>
 
 #define OSSP_VERSION		"1.3.2"
@@ -64,8 +65,16 @@ enum ossp_notify_opcode {
 	OSSP_NOTIFY_POLL,
 	OSSP_NOTIFY_OBITUARY,
 	OSSP_NOTIFY_VOLCHG,
+	OSSP_NOTIFY_FILL,
+	OSSP_NOTIFY_STORE,
 
 	OSSP_NR_NOTIFY_OPCODES,
+};
+
+struct ossp_transfer {
+	sem_t sem;
+	size_t pos;
+	size_t bytes;
 };
 
 struct ossp_mixer_arg {

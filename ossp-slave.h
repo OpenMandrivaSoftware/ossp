@@ -18,6 +18,7 @@
 extern char ossp_user_name[OSSP_USER_NAME_LEN];
 extern int ossp_cmd_fd, ossp_notify_fd;
 extern void *ossp_mmap_addr[2];
+extern struct ossp_transfer *ossp_mmap_transfer;
 
 void ossp_slave_init(int argc, char **argv);
 int ossp_slave_process_command(int cmd_fd,

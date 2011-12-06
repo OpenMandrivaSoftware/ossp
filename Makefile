@@ -22,7 +22,7 @@ OSSP_PADSP_CFLAGS := $(shell pkg-config --cflags libpulse)
 endif
 
 ifeq "$(origin OSSP_PADSP_LDFLAGS)" "undefined"
-OSSP_PADSP_LDFLAGS := $(shell pkg-config --libs libpulse)
+OSSP_PADSP_LDFLAGS := $(shell pkg-config --libs libpulse) -lpthread
 endif
 
 ifeq "$(origin OSSP_ALSAP_CFLAGS)" "undefined"

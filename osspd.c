@@ -34,12 +34,7 @@
 #include "ossp.h"
 #include "ossp-util.h"
 
-/*
- * MMAP support needs to be updated to the new fuse MMAP API.  Disable
- * it for the time being.
- */
-#warning mmap support disabled for now
-/* #define OSSP_MMAP */
+#define OSSP_MMAP
 
 #define DFL_MIXER_NAME		"mixer"
 #define DFL_DSP_NAME		"dsp"
@@ -127,8 +122,11 @@ struct ossp_stream {
 	int			vol[2][2];
 	int			vol_set[2][2];
 
-	off_t			mmap_off;
+	int			mmap_fd;
 	size_t			mmap_size;
+	void			*mmap;
+	void			*mmap_addr[2];
+	struct ossp_transfer	*mmap_transfer;
 
 	struct ossp_uid_cnt	*ucnt;
 	struct fuse_session	*se;	/* associated fuse session */
@@ -897,6 +895,79 @@ static void mixer_release(fuse_req_t req, struct fuse_file_info *fi)
  * Stream implementation
  */
 
+static int os_create_shared_memory(struct ossp_stream *os, size_t mmap_size)
+{
+	int rc;
+
+	os->mmap_fd = -1;
+	os->mmap_size = 0;
+
+#ifdef OSSP_MMAP
+	if (mmap_size) {
+		char shmname[32];
+		int fd;
+		void *p;
+	
+		sprintf(shmname, "/ossp.%i", getpid());
+		fd = shm_open(shmname, O_RDWR | O_CREAT | O_EXCL | O_TRUNC,
+			      0600);
+
+		if (fd == -1) {
+			rc = -errno;
+			warn_ose(os, rc, "failed to open shared memory");
+			return rc;
+		}
+		rc = shm_unlink(shmname);
+		if (rc == -1) {
+			rc = -errno;
+			close(fd);
+			warn_ose(os, rc, "failed to unlink shared memory");
+			return rc;
+		}
+		rc = ftruncate(fd, mmap_size + 2*sizeof(struct ossp_transfer));
+		if (rc == -1) {
+			rc = -errno;
+			close(fd);
+			warn_ose(os, rc, "failed to set shared memory size");
+			return rc;
+		}
+		rc = fcntl(fd, F_SETFD, 0); /* reset cloexec */
+		if (rc == -1) {
+			rc = -errno;
+			close(fd);
+			warn_ose(os, rc, "failed to reset close-on-exec for shared memory");
+			return rc;
+		}
+		p = mmap(NULL, mmap_size + 2 * sizeof(struct ossp_transfer),
+			 PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+		if (p == MAP_FAILED) {
+			rc = -errno;
+			close(fd);
+			warn_ose(os, rc, "failed to mmap shared memory");
+			return rc;
+		}
+		os->mmap_addr[PLAY] = p;
+		os->mmap_addr[REC] = p + mmap_size / 2;
+		os->mmap_transfer = p + mmap_size;
+
+		if (sem_init(&os->mmap_transfer[PLAY].sem, 1, 0) == -1 ||
+		    sem_init(&os->mmap_transfer[REC].sem, 1, 0) == -1) {
+			rc = -errno;
+			close(fd);
+			munmap(p, mmap_size + 2 * sizeof(struct ossp_transfer));
+			warn_ose(os, rc, "failed to init shared semaphore");
+			return rc;
+		}
+
+		os->mmap = p;
+		os->mmap_size = mmap_size;
+		os->mmap_fd = fd;
+#endif
+	}
+
+	return 0;
+}
+
 static int alloc_os(size_t stream_size, size_t mmap_size, pid_t pid, uid_t pgrp,
 		    uid_t uid, gid_t gid, int cmd_sock,
 		    const int *notify, struct fuse_session *se,
@@ -958,12 +1029,12 @@ static int alloc_os(size_t stream_size, size_t mmap_size, pid_t pid, uid_t pgrp,
 	os->pgrp = pgrp;
 	os->uid = uid;
 	os->gid = gid;
-	if (mmap_size) {
-		os->mmap_off = os->id * mmap_size;
-		os->mmap_size = mmap_size;
-	}
 	os->ucnt = ucnt;
 	os->se = se;
+
+	rc = os_create_shared_memory(os, mmap_size);
+	if (rc)
+		goto err_unlock;
 
 	memset(os->vol, -1, sizeof(os->vol));
 	memset(os->vol_set, -1, sizeof(os->vol));
@@ -1188,23 +1259,18 @@ static int create_os(const char *slave_path,
 	if (os->slave_pid == 0) {
 		/* child */
 		char id_str[2][16], fd_str[3][16];
-		char mmap_off_str[32], mmap_size_str[32];
+		char mmap_size_str[32];
 		char log_str[16], slave_path_copy[PATH_MAX];
 		char *argv[] = { slave_path_copy, "-u", id_str[0],
 				 "-g", id_str[1], "-c", fd_str[0],
 				 "-n", fd_str[1], "-m", fd_str[2],
-				 "-o", mmap_off_str, "-s", mmap_size_str,
+				 "-s", mmap_size_str,
 				 "-l", log_str, NULL, NULL };
 		struct passwd *pwd;
 
 		/* drop stuff we don't need */
 		if (close(cmd_sock[0]) || close(notify_sock[0]))
 			fatal_e(-errno, "failed to close server pipe fds");
-
-#ifdef OSSP_MMAP
-		if (!mmap_size)
-			close(fuse_mmap_fd(se));
-#endif
 
 		clearenv();
 		pwd = getpwuid(os->uid);
@@ -1229,15 +1295,9 @@ static int create_os(const char *slave_path,
 		snprintf(id_str[1], sizeof(id_str[0]), "%d", os->gid);
 		snprintf(fd_str[0], sizeof(fd_str[0]), "%d", cmd_sock[1]);
 		snprintf(fd_str[1], sizeof(fd_str[1]), "%d", notify_sock[1]);
-		snprintf(fd_str[2], sizeof(fd_str[2]), "%d",
-#ifdef OSSP_MMAP
-			 mmap_size ? fuse_mmap_fd(se) :
-#endif
-			 -1);
-		snprintf(mmap_off_str, sizeof(mmap_off_str), "0x%llx",
-			 (unsigned long long)os->mmap_off);
+		snprintf(fd_str[2], sizeof(fd_str[2]), "%d", os->mmap_fd);
 		snprintf(mmap_size_str, sizeof(mmap_size_str), "0x%zx",
-			 mmap_size);
+			 os->mmap_size);
 		snprintf(log_str, sizeof(log_str), "%d", ossp_log_level);
 		if (ossp_log_timestamp)
 			argv[ARRAY_SIZE(argv) - 2] = "-t";
@@ -1259,13 +1319,12 @@ static int create_os(const char *slave_path,
 	}
 
 	dbg0_os(os, "CREATE slave=%d %s", os->slave_pid, slave_path);
-	dbg0_os(os, "  client=%d cmd=%d:%d notify=%d:%d mmap=%d:0x%llx:%zu",
+	dbg0_os(os, "  client=%d cmd=%d:%d notify=%d:%d mmap=%d:%zu",
 		pid, cmd_sock[0], cmd_sock[1], notify_sock[0], notify_sock[1],
-#ifdef OSSP_MMAP
-		os->mmap_size ? fuse_mmap_fd(se) :
-#endif
-		-1,
-		(unsigned long long)os->mmap_off, os->mmap_size);
+		os->mmap_fd, os->mmap_size);
+
+	close(os->mmap_fd);
+	os->mmap_fd = -1;
 
 	*osp = os;
 	rc = 0;
@@ -1671,9 +1730,18 @@ static int dsp_mmap_dir(int prot)
 	return PLAY;
 }
 
-static void dsp_mmap(fuse_req_t req, void *addr, size_t len, int prot,
-		     int flags, off_t offset, struct fuse_file_info *fi,
-		     uint64_t mh)
+static int dsp_dir_to_mapid(struct ossp_stream *os, int dir)
+{
+	return os->id * 2 + dir + 1;
+}
+
+static int dsp_mapid_to_dir(int map_id)
+{
+	return (map_id - 1) & 1;
+}
+
+static void dsp_mmap(fuse_req_t req, uint64_t addr, size_t len, int prot,
+		     int flags, off_t offset, struct fuse_file_info *fi)
 {
 	int dir = dsp_mmap_dir(prot);
 	struct ossp_dsp_mmap_arg arg = { };
@@ -1688,7 +1756,7 @@ static void dsp_mmap(fuse_req_t req, void *addr, size_t len, int prot,
 	}
 	dsps = os_to_dsps(os);
 
-	if (!os->mmap_off || len > os->mmap_size / 2) {
+	if (len > os->mmap_size / 2) {
 		fuse_reply_err(req, EINVAL);
 		return;
 	}
@@ -1710,13 +1778,13 @@ out_unlock:
 	pthread_mutex_unlock(&os->mmap_mutex);
 
 	if (ret == 0)
-		fuse_reply_mmap(req, os->mmap_off + dir * os->mmap_size / 2, 0);
+		fuse_reply_mmap(req, dsp_dir_to_mapid(os, dir), os->mmap_size / 2);
 	else
 		fuse_reply_err(req, -ret);
 }
 
-static void dsp_munmap(fuse_req_t req, size_t len, struct fuse_file_info *fi,
-		       off_t offset, uint64_t mh)
+static void dsp_munmap(fuse_req_t req, uint64_t map_id, size_t length,
+		       struct fuse_file_info *fi)
 {
 	struct ossp_stream *os;
 	struct ossp_dsp_stream *dsps;
@@ -1729,13 +1797,11 @@ static void dsp_munmap(fuse_req_t req, size_t len, struct fuse_file_info *fi,
 
 	pthread_mutex_lock(&os->mmap_mutex);
 
-	for (dir = 0; dir < 2; dir++)
-		if (offset == os->mmap_off + dir * os->mmap_size / 2)
-			break;
-	if (dir == 2 || len > os->mmap_size / 2) {
-		warn_os(os, "invalid munmap request "
-			"offset=%llu len=%zu mmapped=0x%x",
-			(unsigned long long)offset, len, dsps->mmapped);
+	dir = dsp_mapid_to_dir(map_id);
+	if (dsp_dir_to_mapid(os, dir) != map_id ||
+	    (dir != PLAY && dir != REC) || length != os->mmap_size / 2) {
+		warn_os(os, "invalid munmap request map_id=%llu len=%zu mmapped=0x%x",
+			(unsigned long long) map_id, length, dsps->mmapped);
 		goto out_unlock;
 	}
 
@@ -1748,7 +1814,80 @@ static void dsp_munmap(fuse_req_t req, size_t len, struct fuse_file_info *fi,
 out_unlock:
 	pthread_mutex_unlock(&os->mmap_mutex);
 out:
-	fuse_reply_none(req);
+	fuse_reply_err(req, -rc);
+}
+
+static void fill_mmap_buffer(struct ossp_stream *os)
+{
+	int rc;
+	struct fuse_chan *ch = fuse_session_next_chan(os->se, NULL);
+	unsigned mapid = dsp_dir_to_mapid(os, PLAY);
+	size_t pos = os->mmap_transfer[PLAY].pos;
+	size_t bytes = os->mmap_transfer[PLAY].bytes;
+
+	dbg1_os(os, "fill mmap buffer pos=%zu bytes=%zu", pos, bytes);
+
+	rc = fuse_lowlevel_notify_retrieve(ch, mapid, bytes, pos, os);
+	if (rc)
+		sem_post(&os->mmap_transfer[PLAY].sem);
+}
+
+static void dsp_retrieve_reply(fuse_req_t req, void *cookie, uint64_t map_id,
+			       off_t offset, struct fuse_bufvec *bufv)
+{
+	struct ossp_stream *os = cookie;
+	size_t size = fuse_buf_size(bufv);
+	struct fuse_bufvec dest = FUSE_BUFVEC_INIT(size);
+	ssize_t res;
+
+	if (dsp_mapid_to_dir(map_id) != PLAY ||
+	    dsp_dir_to_mapid(os, PLAY) != map_id ||
+	    offset != os->mmap_transfer[PLAY].pos ||
+	    size > os->mmap_transfer[PLAY].bytes) {
+		warn_os(os, "invalid retrieve reply map_id=%llu offset=%llu, size=%zu",
+			(unsigned long long) map_id,
+			(unsigned long long) offset, size);
+		sem_post(&os->mmap_transfer[PLAY].sem);	
+		return;
+	}
+
+	dest.buf[0].mem = os->mmap_addr[PLAY] + offset;
+
+	res = fuse_buf_copy(&dest, bufv, 0);
+	if (res < 0)
+		warn_ose(os, res, "dsp_retrieve_reply: buffer copy");
+	else if ((size_t) res < size) {
+		warn_os(os, "dsp_retrieve_reply: short buffer copy");
+	}
+
+	if (size < os->mmap_transfer[PLAY].bytes) {
+		os->mmap_transfer[PLAY].bytes -= size;
+		os->mmap_transfer[PLAY].pos += size;
+
+		fill_mmap_buffer(os);
+	} else {
+		sem_post(&os->mmap_transfer[PLAY].sem);	
+	}
+}
+
+static void store_mmap_buffer(struct ossp_stream *os)
+{
+	int rc;
+	struct fuse_chan *ch = fuse_session_next_chan(os->se, NULL);
+	unsigned mapid = dsp_dir_to_mapid(os, REC);
+	size_t pos = os->mmap_transfer[REC].pos;
+	size_t bytes = os->mmap_transfer[REC].bytes;
+	struct fuse_bufvec bufv = FUSE_BUFVEC_INIT(bytes);
+
+	dbg1_os(os, "store mmap buffer pos=%zu bytes=%zu", pos, bytes);
+
+	bufv.buf[0].mem = os->mmap_addr[REC] + pos;
+		
+	rc = fuse_lowlevel_notify_store(ch, mapid, pos, &bufv, 0);
+	if (rc < 0)
+		warn_ose(os, rc, "store_mmap_buffer: failure");
+
+	sem_post(&os->mmap_transfer[REC].sem);
 }
 #endif
 
@@ -1815,6 +1954,14 @@ repeat:
 				os->mixer->modify_counter++;
 				pthread_mutex_unlock(&mixer_mutex);
 				break;
+#ifdef OSSP_MMAP
+			case OSSP_NOTIFY_FILL:
+				fill_mmap_buffer(os);
+				break;
+			case OSSP_NOTIFY_STORE:
+				store_mmap_buffer(os);
+				break;
+#endif
 			default:
 			unknown:
 				warn_os(os, "unknown notification %d",
@@ -1852,6 +1999,9 @@ repeat:
 		pthread_mutex_unlock(&mutex);
 	}
 	goto repeat;
+
+	/* not reachable */
+	return NULL;
 }
 
 
@@ -1891,9 +2041,20 @@ repeat:
 
 	dbg1_os(os, "slave %d reaped", os->slave_pid);
 	__clear_bit(os->id, os_id_bitmap);
+	if (os->mmap_size) {
+		sem_destroy(&os->mmap_transfer[PLAY].sem);
+		sem_destroy(&os->mmap_transfer[REC].sem);
+
+		munmap(os->mmap, os->mmap_size + 2 * sizeof(struct ossp_transfer));
+		close(os->mmap_fd);
+	}
+		
 	free(os);
 
 	goto repeat;
+
+	/* not reachable */
+	return NULL;
 }
 
 
@@ -1985,6 +2146,7 @@ static const struct cuse_lowlevel_ops dsp_ops = {
 #ifdef OSSP_MMAP
 	.mmap			= dsp_mmap,
 	.munmap			= dsp_munmap,
+	.retrieve_reply		= dsp_retrieve_reply,
 #endif
 };
 
@@ -1998,6 +2160,7 @@ static const struct cuse_lowlevel_ops adsp_ops = {
 #ifdef OSSP_MMAP
 	.mmap			= dsp_mmap,
 	.munmap			= dsp_munmap,
+	.retrieve_reply		= dsp_retrieve_reply,
 #endif
 };
 
@@ -2091,11 +2254,7 @@ static struct fuse_session *setup_ossp_cuse(const struct cuse_lowlevel_ops *ops,
 	}
 
 	fd = fuse_chan_fd(fuse_session_next_chan(se, NULL));
-	if (
-#ifdef OSSP_MMAP
-		fd != fuse_mmap_fd(se) &&
-#endif
-		fcntl(fd, F_SETFD, FD_CLOEXEC) < 0) {
+	if (fcntl(fd, F_SETFD, FD_CLOEXEC) < 0) {
 		err_e(-errno, "failed to set CLOEXEC on %s CUSE fd", name);
 		cuse_lowlevel_teardown(se);
 		return NULL;

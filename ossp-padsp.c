@@ -784,6 +784,58 @@ static ssize_t padsp_open(enum ossp_opcode opcode,
 	return 0;
 }
 
+static void notify_mmap_fill_play(size_t mmap_size, size_t pos, size_t bytes)
+{
+	while (bytes) {
+		ssize_t ret;
+		size_t count = min(bytes, mmap_size - pos);
+		struct ossp_notify event = { .magic = OSSP_NOTIFY_MAGIC,
+					     .opcode = OSSP_NOTIFY_FILL };
+
+		ossp_mmap_transfer[PLAY].pos = pos;
+		ossp_mmap_transfer[PLAY].bytes = count;
+
+		ret = write(ossp_notify_fd, &event, sizeof(event));
+		if (ret != sizeof(event)) {
+			if (errno != EPIPE)
+				err_e(-errno, "write to notify_fd failed");
+
+			padsp_done();
+			return;
+		}
+		sem_wait(&ossp_mmap_transfer[PLAY].sem);
+
+		bytes -= count;
+		pos = (pos + count) % mmap_size;
+	}
+}
+
+static void notify_mmap_store_rec(size_t mmap_size, size_t pos, size_t bytes)
+{
+	while (bytes) {
+		ssize_t ret;
+		size_t count = min(bytes, mmap_size - pos);
+		struct ossp_notify event = { .magic = OSSP_NOTIFY_MAGIC,
+					     .opcode = OSSP_NOTIFY_STORE };
+
+		ossp_mmap_transfer[REC].pos = pos;
+		ossp_mmap_transfer[REC].bytes = count;
+
+		ret = write(ossp_notify_fd, &event, sizeof(event));
+		if (ret != sizeof(event)) {
+			if (errno != EPIPE)
+				err_e(-errno, "write to notify_fd failed");
+
+			padsp_done();
+			return;
+		}
+		sem_wait(&ossp_mmap_transfer[REC].sem);
+
+		bytes -= count;
+		pos = (pos + count) % mmap_size;
+	}
+}
+
 static void mmap_fill_pstg(void)
 {
 	struct ring_buf *stg = &mmap_stg[PLAY];
@@ -811,6 +863,8 @@ static void mmap_fill_pstg(void)
 		mmap_sync[PLAY] = 1;
 		bytes = space;
 	}
+
+	notify_mmap_fill_play(mmap_size, mmap_idx[PLAY] % mmap_size, bytes);
 
 	ring_manual_init(&mmap, mmap_map[PLAY], mmap_size,
 			 new_idx % mmap_size, bytes);
@@ -897,6 +951,8 @@ static void mmap_consume_rstg(void)
 		ring_consume(stg, todo);
 		space -= todo;
 	}
+
+	notify_mmap_store_rec(mmap_size, fill_idx % mmap_size, ring_bytes(&mmap));
 
  skip:
 	mmap_idx[REC] = new_idx;
