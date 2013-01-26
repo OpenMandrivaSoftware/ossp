@@ -2281,7 +2281,7 @@ static int process_arg(void *data, const char *arg, int key,
 
 	switch (key) {
 	case 0:
-		fprintf(stderr, usage);
+		fputs(usage, stderr);
 		param->help = 1;
 		return 0;
 	case 1:
