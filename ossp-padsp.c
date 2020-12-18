@@ -22,6 +22,8 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <linux/limits.h>
+#include <stdlib.h>
 
 #include <pulse/pulseaudio.h>
 #include <sys/soundcard.h>
@@ -1534,8 +1536,14 @@ static void action_post(void)
 int main(int argc, char **argv)
 {
 	int rc;
+	static char runtime_dir[PATH_MAX];
 
 	ossp_slave_init(argc, argv);
+
+	snprintf(runtime_dir, sizeof runtime_dir, "/run/user/%llu",
+		(long long unsigned) getuid());
+	if (access(runtime_dir, R_OK | X_OK) == 0)
+		setenv("XDG_RUNTIME_DIR", runtime_dir, 0);
 
 	page_size = sysconf(_SC_PAGE_SIZE);
 
