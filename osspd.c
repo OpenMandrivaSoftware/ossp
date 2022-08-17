@@ -1125,56 +1125,43 @@ static void put_os(struct ossp_stream *os)
 	pthread_mutex_unlock(&mutex);
 }
 
-static void set_extra_env(pid_t pid)
+static void set_extra_env(const pid_t pid)
 {
-	char procenviron[32];
-	const int step = 1024;
-	char *data = malloc(step + 1);
-	int ofs = 0;
-	int fd;
-	int ret;
+	char *line = NULL;
+	FILE *file;
+	size_t size;
+	ssize_t len;
 
-	if (!data)
-		return;
+	char path[32];
+	snprintf(path, sizeof(path), "/proc/%d/environ", pid);
 
-	sprintf(procenviron, "/proc/%d/environ", pid);
-	fd = open(procenviron, O_RDONLY);
-	if (fd < 0)
+	file = fopen(path, "r");
+	if (!file)
 		return;
 
 	/*
-	 * There should really be a 'read whole file to a newly allocated
-	 * buffer' function.
+	 * Copy all PULSE variables and DISPLAY so that
+	 * ssh -X remotehost 'mplayer -ao oss' will work.
 	 */
-	while ((ret = read(fd, data + ofs, step)) > 0) {
-		char *newdata;
-		ofs += ret;
-		newdata = realloc(data, ofs + step + 1);
-		if (!newdata) {
-			ret = -1;
-			break;
-		}
-		data = newdata;
-	}
-	if (ret == 0) {
-		char *ptr = data;
-		/* Append the extra 0 for end condition */
-		data[ofs] = 0;
+	while ((len = getdelim(&line, &size, '\0', file)) != -1) {
+		char *sign = NULL;
 
-		while ((ret = strlen(ptr)) > 0) {
-			/*
-			 * Copy all PULSE variables and DISPLAY so that
-			 * ssh -X remotehost 'mplayer -ao oss' will work
-			 */
-			if (!strncmp(ptr, "DISPLAY=", 8) ||
-			    !strncmp(ptr, "PULSE_", 6))
-				putenv(ptr);
-			ptr += ret + 1;
+		if (len <= 6)
+			continue;
+
+		if (strncmp(line, "PULSE_", 6) == 0)
+			sign = strchr(line, '=');
+		else if (len >= 8 && strncmp(line, "DISPLAY=", 8) == 0)
+			sign = line + 7;
+
+		if (sign) {
+			*sign = '\0';
+			setenv(line, sign + 1, 1);
 		}
 	}
 
-	free(data);
-	close(fd);
+	free(line);
+	fclose(file);
 }
 
 static int create_os(const char *slave_path,
