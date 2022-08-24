@@ -2,6 +2,7 @@
 # DESTDIR is completely respected
 CC := gcc
 AR := ar
+PKG_CONFIG ?= pkg-config
 CFLAGS := -Wall $(CFLAGS)
 XLDFLAGS := $(LDFLAGS)
 LDFLAGS := -L. -lossp $(LDFLAGS)
@@ -10,27 +11,27 @@ DESTDIR :=
 UDEVDIR := /etc/udev/rules.d
 
 ifeq "$(origin OSSPD_CFLAGS)" "undefined"
-OSSPD_CFLAGS := $(shell pkg-config --cflags fuse)
+OSSPD_CFLAGS := $(shell $(PKG_CONFIG) --cflags fuse)
 endif
 
 ifeq "$(origin OSSPD_LDFLAGS)" "undefined"
-OSSPD_LDFLAGS := $(shell pkg-config --libs fuse)
+OSSPD_LDFLAGS := $(shell $(PKG_CONFIG) --libs fuse)
 endif
 
 ifeq "$(origin OSSP_PADSP_CFLAGS)" "undefined"
-OSSP_PADSP_CFLAGS := $(shell pkg-config --cflags libpulse)
+OSSP_PADSP_CFLAGS := $(shell $(PKG_CONFIG) --cflags libpulse)
 endif
 
 ifeq "$(origin OSSP_PADSP_LDFLAGS)" "undefined"
-OSSP_PADSP_LDFLAGS := $(shell pkg-config --libs libpulse) -lpthread
+OSSP_PADSP_LDFLAGS := $(shell $(PKG_CONFIG) --libs libpulse) -lpthread
 endif
 
 ifeq "$(origin OSSP_ALSAP_CFLAGS)" "undefined"
-OSSP_ALSAP_CFLAGS := $(shell pkg-config --libs alsa)
+OSSP_ALSAP_CFLAGS := $(shell $(PKG_CONFIG) --libs alsa)
 endif
 
 ifeq "$(origin OSSP_ALSAP_LDFLAGS)" "undefined"
-OSSP_ALSAP_LDFLAGS := $(shell pkg-config --libs alsa)
+OSSP_ALSAP_LDFLAGS := $(shell $(PKG_CONFIG) --libs alsa)
 endif
 
 headers := ossp.h ossp-util.h ossp-slave.h
