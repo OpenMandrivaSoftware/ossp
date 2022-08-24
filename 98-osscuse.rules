@@ -1,7 +1,6 @@
-# Since these devices are not part of 'sound' subsystem the group is forced
-# to audio by name
+# Allow everyone to use these devices
 # /dev/cuse can stay  mode 0660 root:root since osspd is run as root
 # and drops privileges to user level when opened by user
-KERNEL=="dsp", GROUP="audio"
-KERNEL=="mixer", GROUP="audio"
-KERNEL=="adsp", GROUP="audio"
+KERNEL=="dsp", SUBSYSTEM=="cuse", MODE="0666"
+KERNEL=="mixer", SUBSYSTEM=="cuse", MODE="0666"
+KERNEL=="adsp", SUBSYSTEM=="cuse", MODE="0666"
