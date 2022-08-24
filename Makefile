@@ -3,7 +3,7 @@
 CC := gcc
 AR := ar
 PKG_CONFIG ?= pkg-config
-CFLAGS := -Wall $(CFLAGS)
+CFLAGS := -Wall $(CFLAGS) $(CPPFLAGS)
 XLDFLAGS := $(LDFLAGS)
 LDFLAGS := -L. -lossp $(LDFLAGS)
 prefix := /usr/local
