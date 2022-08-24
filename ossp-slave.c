@@ -85,7 +85,7 @@ void ossp_slave_init(int argc, char **argv)
 	}
 
 	if (!have_uid || !have_gid || ossp_cmd_fd < 0 || ossp_notify_fd < 0) {
-		fprintf(stderr, usage);
+		fputs(usage, stderr);
 		_exit(1);
 	}
 
@@ -101,7 +101,7 @@ void ossp_slave_init(int argc, char **argv)
 		void *p;
 
 		if (!mmap_size) {
-			fprintf(stderr, usage);
+			fputs(usage, stderr);
 			_exit(1);
 		}
 
