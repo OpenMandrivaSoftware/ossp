@@ -34,8 +34,6 @@
 #include "ossp.h"
 #include "ossp-util.h"
 
-#define OSSP_MMAP
-
 #define DFL_MIXER_NAME		"mixer"
 #define DFL_DSP_NAME		"dsp"
 #define DFL_ADSP_NAME		"adsp"
@@ -897,7 +895,7 @@ static void mixer_release(fuse_req_t req, struct fuse_file_info *fi)
 
 static int os_create_shared_memory(struct ossp_stream *os, size_t mmap_size)
 {
-	int rc;
+	int rc = 0;
 
 	os->mmap_fd = -1;
 	os->mmap_size = 0;
@@ -962,10 +960,10 @@ static int os_create_shared_memory(struct ossp_stream *os, size_t mmap_size)
 		os->mmap = p;
 		os->mmap_size = mmap_size;
 		os->mmap_fd = fd;
-#endif
 	}
+#endif
 
-	return 0;
+	return rc;
 }
 
 static int alloc_os(size_t stream_size, size_t mmap_size, pid_t pid, uid_t pgrp,
