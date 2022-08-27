@@ -32,6 +32,11 @@ add_library(libossp OBJECT
 	"ossp-util.h"
 )
 
+target_compile_definitions(libossp
+	PUBLIC
+		"OSSP_VERSION=\"${PROJECT_VERSION}\""
+)
+
 # Daemon
 if(daemon)
 	add_executable(osspd "osspd.c")
