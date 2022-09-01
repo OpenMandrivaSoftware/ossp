@@ -1126,6 +1126,12 @@ static void put_os(struct ossp_stream *os)
 
 static void set_extra_env(const pid_t pid)
 {
+	const char *target_vars[] = {
+		"DISPLAY=",        // Display manager
+		"PULSE_",          // PulseAudio
+		"XDG_RUNTIME_DIR=" // Audio servers
+	};
+
 	char *line = NULL;
 	FILE *file;
 	size_t size;
@@ -1138,24 +1144,17 @@ static void set_extra_env(const pid_t pid)
 	if (!file)
 		return;
 
-	/*
-	 * Copy all PULSE variables and DISPLAY so that
-	 * ssh -X remotehost 'mplayer -ao oss' will work.
-	 */
 	while ((len = getdelim(&line, &size, '\0', file)) != -1) {
-		char *sign = NULL;
+		for (uint8_t i = 0; i < ARRAY_SIZE(target_vars); ++i) {
+			char *sign;
 
-		if (len <= 6)
-			continue;
+			if (strncmp(line, target_vars[i], strlen(target_vars[i])) != 0)
+				continue;
 
-		if (strncmp(line, "PULSE_", 6) == 0)
-			sign = strchr(line, '=');
-		else if (len >= 8 && strncmp(line, "DISPLAY=", 8) == 0)
-			sign = line + 7;
-
-		if (sign) {
-			*sign = '\0';
-			setenv(line, sign + 1, 1);
+			if ((sign = strchr(line, '='))) {
+				*sign = '\0';
+				setenv(line, sign + 1, 1);
+			}
 		}
 	}
 
