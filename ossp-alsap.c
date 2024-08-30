@@ -1,12 +1,7 @@
 /*
- * ossp-alsap - ossp DSP slave which forwards to alsa
- *
- * Copyright (C)      2009 Maarten Lankhorst <m.b.lankhorst@gmail.com>
+ * ossp-alsap - ossp DSP slave which forwards to ALSA
  *
  * This file is released under the GPLv2.
- *
- * Why an alsa plugin as well? Just to show how much
- * the alsa userspace api sucks ;-)
  */
 
 #include <assert.h>

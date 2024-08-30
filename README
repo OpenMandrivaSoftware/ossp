@@ -1,9 +1,6 @@
 
  OSS Proxy - emulate OSS device using CUSE
 
- Copyright (C) 2008-2009  SUSE Linux Products GmbH
- Copyright (C) 2008-2009  Tejun Heo <tj@kernel.org>
-
 1. What is it?
 --------------
 

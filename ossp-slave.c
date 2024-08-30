@@ -1,9 +1,6 @@
 /*
  * ossp-slave - OSS Proxy: Common codes for slaves
  *
- * Copyright (C) 2008-2010  SUSE Linux Products GmbH
- * Copyright (C) 2008-2010  Tejun Heo <tj@kernel.org>
- *
  * This file is released under the GPLv2.
  */
 

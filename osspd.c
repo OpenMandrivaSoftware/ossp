@@ -1,9 +1,6 @@
 /*
  * osspd - OSS Proxy Daemon: emulate OSS device using CUSE
  *
- * Copyright (C) 2008-2010  SUSE Linux Products GmbH
- * Copyright (C) 2008-2010  Tejun Heo <tj@kernel.org>
- *
  * This file is released under the GPLv2.
  */
 
@@ -2323,8 +2320,7 @@ int main(int argc, char **argv)
 	/* daemonization already handled, prevent forking inside FUSE */
 	fuse_opt_add_arg(&args, "-f");
 
-	info("OSS Proxy v%s (C) 2008-2010 by Tejun Heo <teheo@suse.de>",
-	     OSSP_VERSION);
+	info("OSS Proxy v%s", OSSP_VERSION);
 
 	/* ignore stupid SIGPIPEs */
 	memset(&sa, 0, sizeof(sa));

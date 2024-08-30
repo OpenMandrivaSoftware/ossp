@@ -1,8 +1,5 @@
 /*
- * ossp-padsp - ossp DSP slave which forwards to pulseaduio
- *
- * Copyright (C) 2008-2010  SUSE Linux Products GmbH
- * Copyright (C) 2008-2010  Tejun Heo <tj@kernel.org>
+ * ossp-padsp - ossp DSP slave which forwards to PulseAudio
  *
  * This file is released under the GPLv2.
  */

@@ -1,7 +1,5 @@
 /* Simple oss testsuite
  *
- * Copyright (C) 2009 Maarten Lankhorst <m.b.lankhorst@gmail.com>
- *
  * This file is released under the GPLv2.
  */
 
