@@ -5,7 +5,7 @@ list(APPEND CMAKE_MODULE_PATH
 )
 
 project("OSS Proxy"
-	VERSION 1.3.2
+	VERSION 1.3.3
 	DESCRIPTION "Emulate OSS device(s) using CUSE."
 	HOMEPAGE_URL "https://github.com/OpenMandrivaSoftware/ossp"
 	LANGUAGES "C"
