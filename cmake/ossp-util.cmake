@@ -2,8 +2,15 @@ include(GNUInstallDirs)
 
 find_package(PkgConfig REQUIRED)
 
+pkg_check_modules(PKGCONFIG_UDEV udev QUIET)
+if(PKGCONFIG_UDEV_FOUND)
+	pkg_get_variable(UDEVDIR udev udevdir)
+else()
+	set(UDEVDIR "${CMAKE_INSTALL_PREFIX}/lib/udev")
+endif()
+
 set(INSTALL_UDEVRULESDIR
-	"${CMAKE_INSTALL_PREFIX}/lib/udev/rules.d"
+	"${UDEVDIR}/rules.d"
 	CACHE PATH
 	"Install path for udev rules."
 )
