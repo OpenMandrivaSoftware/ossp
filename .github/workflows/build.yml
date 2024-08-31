@@ -22,7 +22,7 @@ jobs:
       - name: Install packages
         run: sudo apt-get install -y cmake
                                      ninja-build
-                                     libfuse-dev
+                                     libfuse3-dev
                                      libasound-dev
                                      libpulse-dev
 

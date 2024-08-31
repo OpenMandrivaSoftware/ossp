@@ -42,7 +42,7 @@ if(daemon)
 	add_executable(osspd "osspd.c")
 	set_output_dir(osspd)
 
-	link_pkg(osspd "fuse")
+	link_pkg(osspd "fuse3")
 	target_link_libraries(osspd PRIVATE libossp)
 
 	install_daemon(osspd)
