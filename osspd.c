@@ -4,7 +4,7 @@
  * This file is released under the GPLv2.
  */
 
-#define FUSE_USE_VERSION 28
+#define FUSE_USE_VERSION 35
 #define _GNU_SOURCE
 
 #include <assert.h>
@@ -2226,16 +2226,17 @@ static struct fuse_session *setup_ossp_cuse(const struct cuse_lowlevel_ops *ops,
 				.flags = CUSE_UNRESTRICTED_IOCTL };
 	struct fuse_session *se;
 	int fd;
+	int multithreaded;
 
 	snprintf(name_buf, sizeof(name_buf), "DEVNAME=%s", name);
 
-	se = cuse_lowlevel_setup(argc, argv, &ci, ops, NULL, NULL);
+	se = cuse_lowlevel_setup(argc, argv, &ci, ops, &multithreaded, NULL);
 	if (!se) {
 		err("failed to setup %s CUSE", name);
 		return NULL;
 	}
 
-	fd = fuse_chan_fd(fuse_session_next_chan(se, NULL));
+	fd = fuse_session_fd(se);
 	if (fcntl(fd, F_SETFD, FD_CLOEXEC) < 0) {
 		err_e(-errno, "failed to set CLOEXEC on %s CUSE fd", name);
 		cuse_lowlevel_teardown(se);
@@ -2250,7 +2251,7 @@ static void *cuse_worker(void *arg)
 	struct fuse_session *se = arg;
 	int rc;
 
-	rc = fuse_session_loop_mt(se);
+	rc = fuse_session_loop_mt(se, NULL);
 	cuse_lowlevel_teardown(se);
 
 	return (void *)(unsigned long)rc;
