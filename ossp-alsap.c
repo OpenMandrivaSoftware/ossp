@@ -572,7 +572,7 @@ int main(int argc, char **argv)
 {
 	int rc;
 
-	ossp_slave_init(argc, argv);
+	ossp_slave_init("ossp-alsap", argc, argv);
 
 	page_size = sysconf(_SC_PAGE_SIZE);
 

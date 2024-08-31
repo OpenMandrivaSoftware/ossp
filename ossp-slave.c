@@ -38,7 +38,7 @@ int ossp_cmd_fd = -1, ossp_notify_fd = -1;
 void *ossp_mmap_addr[2];
 struct ossp_transfer *ossp_mmap_transfer;
 
-void ossp_slave_init(int argc, char **argv)
+void ossp_slave_init(const char *slave_name, int argc, char **argv)
 {
 	int have_uid = 0, have_gid = 0;
 	uid_t uid;
@@ -91,8 +91,8 @@ void ossp_slave_init(int argc, char **argv)
 		snprintf(ossp_user_name, sizeof(ossp_user_name), "%s",
 			 pw->pw_name);
 
-	snprintf(ossp_log_name, sizeof(ossp_log_name), "ossp-padsp[%s:%d]",
-		 ossp_user_name, getpid());
+	snprintf(ossp_log_name, sizeof(ossp_log_name), "%s[%s:%d]",
+		 slave_name, ossp_user_name, getpid());
 
 	if (mmap_fd >= 0) {
 		void *p;
